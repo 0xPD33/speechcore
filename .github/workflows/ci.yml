@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            cmake \
+            glslc \
+            libasound2-dev \
+            libopenblas-dev \
+            libvulkan-dev \
+            pkg-config \
+            portaudio19-dev \
+            vulkan-headers
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Check minimal API
+        run: cargo check --no-default-features
+
+      - name: Lint minimal API
+        run: cargo clippy --no-default-features --all-targets -- -D warnings
+
+      - name: Test minimal API
+        run: cargo test --no-default-features
+
+      - name: Check runtime API without backends
+        run: cargo check --no-default-features --features runtime
+
+      - name: Lint runtime API without backends
+        run: cargo clippy --no-default-features --features runtime --all-targets -- -D warnings
+
+      - name: Check default features
+        run: cargo check
+
+      - name: Lint default features
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test default features
+        run: cargo test
+
+      - name: Check examples
+        run: cargo check --examples
+
+      - name: Check optional Whisper.cpp backend
+        run: cargo check --no-default-features --features backend-whisper-cpp

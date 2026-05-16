@@ -1,0 +1,8 @@
+/target/
+**/*.rs.bk
+*.profraw
+*.profdata
+transcription_stats.log
+*.wav
+*.tmp
+*.downloading
