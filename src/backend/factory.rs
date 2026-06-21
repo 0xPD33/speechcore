@@ -12,7 +12,8 @@ use std::path::Path;
     not(feature = "backend-ctranslate2"),
     not(feature = "backend-whisper-cpp"),
     not(feature = "backend-moonshine"),
-    not(feature = "backend-parakeet")
+    not(feature = "backend-parakeet"),
+    not(feature = "backend-nemotron")
 ))]
 fn disabled_backend_error(feature: &str, backend: BackendType) -> TranscriptionError {
     TranscriptionError::BackendNotImplemented(format!(
@@ -128,6 +129,20 @@ pub async fn create_backend(
             #[cfg(not(feature = "backend-moonshine"))]
             {
                 Err(disabled_backend_error("backend-moonshine", backend_type))
+            }
+        }
+
+        BackendType::Nemotron => {
+            #[cfg(feature = "backend-nemotron")]
+            {
+                let nemotron_backend =
+                    super::nemotron::NemotronBackend::new(model_path, backend_config)?;
+                Ok(TranscriptionBackend::Nemotron(Box::new(nemotron_backend)))
+            }
+
+            #[cfg(not(feature = "backend-nemotron"))]
+            {
+                Err(disabled_backend_error("backend-nemotron", backend_type))
             }
         }
     }
@@ -276,6 +291,28 @@ pub fn validate_model_path(
                 super::moonshine::model::MoonshineModel::validate_model_dir(path).map_err(|e| {
                     TranscriptionError::ConfigurationError(format!(
                         "Moonshine model directory invalid: {}",
+                        e
+                    ))
+                })
+            }
+        }
+
+        BackendType::Nemotron => {
+            #[cfg(not(feature = "backend-nemotron"))]
+            {
+                Err(disabled_backend_error("backend-nemotron", backend_type))
+            }
+
+            #[cfg(feature = "backend-nemotron")]
+            {
+                if !path.is_dir() {
+                    return Err(TranscriptionError::ConfigurationError(
+                        "Nemotron models must be directories".to_string(),
+                    ));
+                }
+                super::nemotron::model::NemotronModel::validate_model_dir(path).map_err(|e| {
+                    TranscriptionError::ConfigurationError(format!(
+                        "Nemotron model directory invalid: {}",
                         e
                     ))
                 })

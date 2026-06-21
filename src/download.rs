@@ -11,8 +11,10 @@ use crate::backend::{BackendType, QuantizationLevel};
 const DEFAULT_WHISPER_MODEL: &str = "openai/whisper-base.en";
 
 /// URL for Silero VAD model
+// Pinned to a stable release. `master` is a moving target and has shipped an
+// ONNX export that returns ~0 probability for all input (breaking VAD).
 const SILERO_VAD_URL: &str =
-    "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx";
+    "https://github.com/snakers4/silero-vad/raw/v5.1.2/src/silero_vad/data/silero_vad.onnx";
 
 /// Default filename for the Silero VAD model
 const SILERO_MODEL_FILENAME: &str = "silero_vad.onnx";
@@ -50,6 +52,11 @@ fn ensure_backend_available(_backend_type: BackendType) -> Result<()> {
     #[cfg(not(feature = "backend-parakeet"))]
     if matches!(_backend_type, BackendType::Parakeet) {
         anyhow::bail!("Parakeet backend is disabled; enable speechcore feature `backend-parakeet`");
+    }
+
+    #[cfg(not(feature = "backend-nemotron"))]
+    if matches!(_backend_type, BackendType::Nemotron) {
+        anyhow::bail!("Nemotron backend is disabled; enable speechcore feature `backend-nemotron`");
     }
 
     #[cfg(not(feature = "backend-whisper-cpp"))]
@@ -567,6 +574,7 @@ fn normalize_model_name(model_name: &str, backend_type: crate::backend::BackendT
             model_name.to_string()
         }
         crate::backend::BackendType::Moonshine => model_name.to_string(),
+        crate::backend::BackendType::Nemotron => model_name.to_string(),
     }
 }
 
@@ -621,6 +629,7 @@ pub async fn init_all_models(
             let model_id = moonshine_model_id(&normalized_model);
             init_moonshine_model(&model_id).await?
         }
+        crate::backend::BackendType::Nemotron => init_nemotron_model_with_progress(None).await?,
     };
 
     Ok((transcription_model_path, silero_model_path))
@@ -663,6 +672,9 @@ pub async fn resolve_model_path_with_progress(
         }
         crate::backend::BackendType::Parakeet => {
             init_parakeet_model_with_progress(&normalized, on_progress).await
+        }
+        crate::backend::BackendType::Nemotron => {
+            init_nemotron_model_with_progress(on_progress).await
         }
     }
 }
@@ -760,6 +772,57 @@ async fn init_parakeet_model_with_progress(
         }
 
         let url = format!("https://huggingface.co/{}/resolve/main/{}", repo, file);
+        download_file_with_progress(&url, &output_path, on_progress).await?;
+    }
+
+    Ok(model_dir)
+}
+
+const NEMOTRON_HF_REPO: &str = "onnx-community/nemotron-3.5-asr-streaming-0.6b-onnx-int4";
+const NEMOTRON_DIR_NAME: &str = "nemotron-3.5-asr-streaming-0.6b-int4";
+const NEMOTRON_MODEL_FILES: [&str; 7] = [
+    "encoder.onnx",
+    "encoder.onnx.data",
+    "decoder.onnx",
+    "decoder.onnx.data",
+    "joint.onnx",
+    "joint.onnx.data",
+    "vocab.txt",
+];
+
+fn is_nemotron_model_complete(model_dir: &Path) -> Result<bool> {
+    for file in NEMOTRON_MODEL_FILES.iter() {
+        if !model_dir.join(file).exists() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+async fn init_nemotron_model_with_progress(
+    on_progress: Option<&(dyn Fn(f64) + Send + Sync)>,
+) -> Result<PathBuf> {
+    let models_dir = get_models_dir()?;
+    let model_dir = models_dir.join(NEMOTRON_DIR_NAME);
+
+    if model_dir.exists() && is_nemotron_model_complete(&model_dir)? {
+        tracing::info!("Nemotron model already exists at: {:?}", model_dir);
+        return Ok(model_dir);
+    }
+
+    if !model_dir.exists() {
+        fs::create_dir_all(&model_dir)?;
+    }
+
+    for file in NEMOTRON_MODEL_FILES.iter() {
+        let output_path = model_dir.join(file);
+        if output_path.exists() {
+            continue;
+        }
+        let url = format!(
+            "https://huggingface.co/{}/resolve/main/{}",
+            NEMOTRON_HF_REPO, file
+        );
         download_file_with_progress(&url, &output_path, on_progress).await?;
     }
 

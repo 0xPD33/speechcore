@@ -4,8 +4,8 @@
 //! selection, model provisioning, and transcript streaming without any UI,
 //! clipboard, tray, or application-specific enhancement code.
 //!
-//! Push-to-talk applications should start with [`SpeechEngine`]. Applications
-//! that need full realtime state/control can use [`RealTimeTranscriber`].
+//! Push-to-talk applications should start with `SpeechEngine`. Applications
+//! that need full realtime state/control can use `RealTimeTranscriber`.
 
 #[cfg(feature = "audio-capture")]
 mod audio_capture;

@@ -1,6 +1,6 @@
 use ndarray::{s, Array, Array2, ArrayBase, ArrayD, Dim, IxDynImpl, OwnedRepr};
 use ort::session::builder::GraphOptimizationLevel;
-use ort::session::{Session, SessionInputs};
+use ort::session::Session;
 use ort::value::Tensor;
 use std::collections::VecDeque;
 use std::path::Path;
@@ -61,14 +61,17 @@ impl Default for VadConfig {
     fn default() -> Self {
         Self {
             threshold: 0.2,
-            frame_size: 512,             // 32ms window at 16kHz
-            sample_rate: 16000,          // 16kHz (supported by Silero VAD)
-            hangbefore_frames: 3,        // 30ms before confirming speech (noise robustness)
-            hangover_frames: 20,         // 200ms after speech before silence
-            hop_samples: 160,            // 10ms hop for overlapping windows
+            frame_size: 512,      // 32ms window at 16kHz
+            sample_rate: 16000,   // 16kHz (supported by Silero VAD)
+            hangbefore_frames: 1, // ~32ms before confirming speech (noise robustness)
+            hangover_frames: 6,   // ~192ms after speech before silence
+            // Silero v5 is a stateful recurrent model and MUST be fed contiguous,
+            // non-overlapping 512-sample frames; a smaller hop re-feeds overlapping
+            // audio and corrupts the recurrent state (probabilities collapse).
+            hop_samples: 512,            // 32ms non-overlapping frame
             max_buffer_duration: 480000, // 30 seconds at 16kHz
             max_segment_count: 20,       // Maximum segments to keep in memory
-            silence_tolerance_frames: 5, // 50ms tolerance in PossibleSpeech (5 frames @ 10ms)
+            silence_tolerance_frames: 2, // ~64ms tolerance in PossibleSpeech (@32ms frames)
             speech_end_threshold: 0.15,  // Lower threshold for speech continuation (hysteresis)
             speech_prob_smoothing: 0.3,  // EMA smoothing factor (production standard)
         }
@@ -226,10 +229,13 @@ impl SileroVad {
         let state_tensor = Tensor::from_array(std::mem::take(&mut self.state))?;
         let sample_rate_tensor = Tensor::from_array(self.sample_rate.to_owned())?;
 
-        // Run inference
-        let inps = ort::inputs![frame_tensor, state_tensor, sample_rate_tensor,];
-
-        let res = self.session.run(SessionInputs::ValueSlice::<3>(&inps))?;
+        // Run inference with NAMED inputs (positional binding proved unreliable
+        // here and left Silero returning a frozen ~0 probability on real speech).
+        let res = self.session.run(ort::inputs! {
+            "input" => frame_tensor,
+            "state" => state_tensor,
+            "sr" => sample_rate_tensor,
+        })?;
 
         // Update internal state
         self.state = res["stateN"].try_extract_array()?.to_owned();

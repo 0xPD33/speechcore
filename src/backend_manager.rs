@@ -85,6 +85,7 @@ impl BackendManager {
                             BackendType::WhisperCpp => "WhisperCpp".to_string(),
                             BackendType::Moonshine => "Moonshine".to_string(),
                             BackendType::Parakeet => "Parakeet".to_string(),
+                            BackendType::Nemotron => "Nemotron".to_string(),
                         };
                         s.model_name = model_name.clone();
                         s.state = BackendStatusState::Loading("Resolving model...".to_string());

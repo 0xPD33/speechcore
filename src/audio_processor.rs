@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use tokio::time::Duration;
 
 use crate::config::{AudioProcessorConfig, SpeechConfig};
-use crate::real_time_transcriber::TranscriptionMode;
+use crate::real_time_transcriber::{StreamEvent, TranscriptionMode};
 use crate::silero_audio_processor::{AudioSegment, SileroVad, VadState};
 use crate::state::AudioVisualizationData;
 use crate::transcription_stats::TranscriptionStats;
@@ -21,6 +21,7 @@ pub struct AudioProcessor {
     audio_processor: Arc<Mutex<SileroVad>>,
     audio_visualization_data: Arc<RwLock<AudioVisualizationData>>,
     segment_tx: mpsc::Sender<AudioSegment>,
+    stream_tx: mpsc::Sender<crate::real_time_transcriber::StreamEvent>,
     buffer_size: usize,
     config: AudioProcessorConfig,
     transcription_stats: Arc<Mutex<TranscriptionStats>>,
@@ -55,6 +56,7 @@ impl AudioProcessor {
         transcription_mode: Arc<AtomicU8>,
         transcription_stats: Arc<Mutex<TranscriptionStats>>,
         manual_session_tx: mpsc::Sender<crate::real_time_transcriber::ManualSessionCommand>,
+        stream_tx: mpsc::Sender<crate::real_time_transcriber::StreamEvent>,
         app_config: SpeechConfig,
     ) -> Self {
         // Calculate manual buffer size from max_recording_duration_secs and sample_rate
@@ -77,6 +79,7 @@ impl AudioProcessor {
             audio_processor,
             audio_visualization_data,
             segment_tx,
+            stream_tx,
             buffer_size: app_config.audio_processor_config.buffer_size,
             config: app_config.audio_processor_config.clone(),
             transcription_stats,
@@ -99,6 +102,7 @@ impl AudioProcessor {
         let audio_processor = self.audio_processor.clone();
         let audio_visualization_data = self.audio_visualization_data.clone();
         let segment_tx = self.segment_tx.clone();
+        let stream_tx = self.stream_tx.clone();
         let _config = self.config.clone();
         let buffer_size = self.buffer_size;
         let transcription_mode = self.transcription_mode.clone();
@@ -120,12 +124,20 @@ impl AudioProcessor {
         tokio::spawn(async move {
             let mut _last_vad_state = VadState::Silence;
             let mut latest_is_speaking = false;
+            // Tracks whether a streaming utterance is currently open.
+            let mut stream_active = false;
 
             while running.load(Ordering::Relaxed) {
                 // Check if we should be processing audio or just doing decay animation
                 let is_recording = recording.load(Ordering::Relaxed);
 
                 if !is_recording {
+                    // Recording stopped mid-utterance: close any open stream.
+                    if stream_active {
+                        let _ = stream_tx.send(StreamEvent::End).await;
+                        stream_active = false;
+                    }
+
                     // When paused, decay spectrogram to zero instead of clearing immediately.
                     // Only keep the tight 60 Hz loop while there is data to animate.
                     let sleep_duration = {
@@ -234,6 +246,34 @@ impl AudioProcessor {
                                     ).await;
                                 }
                             }
+                        }
+
+                        // Emit streaming events for streaming-capable backends in
+                        // REALTIME mode only (utterance follows VAD speech). Manual
+                        // mode is batch — it transcribes the whole recording once on
+                        // stop; streaming there would duplicate that as a preview
+                        // then a final ("transcribes twice"). (No-op downstream when
+                        // the active backend doesn't support streaming.)
+                        let utterance_active = match current_mode {
+                            TranscriptionMode::RealTime => latest_is_speaking,
+                            TranscriptionMode::Manual => false,
+                        };
+                        if utterance_active && !stream_active {
+                            let sid = session_id_ref.read().clone();
+                            let _ = stream_tx.send(StreamEvent::Start { session_id: sid }).await;
+                            // Seed with preroll context (already includes this chunk).
+                            let preroll: Vec<f32> = preroll_buffer.iter().copied().collect();
+                            if !preroll.is_empty() {
+                                let _ = stream_tx.send(StreamEvent::Chunk(preroll)).await;
+                            }
+                            stream_active = true;
+                        } else if utterance_active {
+                            let _ = stream_tx
+                                .send(StreamEvent::Chunk(audio_buffer.clone()))
+                                .await;
+                        } else if stream_active {
+                            let _ = stream_tx.send(StreamEvent::End).await;
+                            stream_active = false;
                         }
                     }
                     Ok(None) => {

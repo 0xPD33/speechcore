@@ -46,11 +46,27 @@ impl TranscriptionMode {
     }
 }
 
-/// Transcription with session tracking
+/// Transcription with session tracking.
+///
+/// `is_final == false` marks an interim streaming hypothesis: consumers should
+/// display it as a live preview but not commit it (no history append, clipboard,
+/// or enhancement). A final message with the same `session_id` supersedes it.
 #[derive(Debug, Clone)]
 pub struct TranscriptionMessage {
     pub text: String,
     pub session_id: Option<String>,
+    pub is_final: bool,
+}
+
+/// Live-audio events sent from the audio pipeline to the streaming worker.
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    /// A new utterance started (speech onset in realtime, recording start in manual).
+    Start { session_id: Option<String> },
+    /// A chunk of utterance audio (16 kHz mono f32).
+    Chunk(Vec<f32>),
+    /// The utterance ended; flush and reset streaming state.
+    End,
 }
 
 impl From<&str> for TranscriptionMode {
@@ -201,6 +217,8 @@ pub struct RealTimeTranscriber {
     // Communication channels for sub-components
     segment_tx: mpsc::Sender<AudioSegment>,
     segment_rx: Option<mpsc::Receiver<AudioSegment>>,
+    stream_tx: mpsc::Sender<StreamEvent>,
+    stream_rx: Option<mpsc::Receiver<StreamEvent>>,
     transcription_done_tx: mpsc::UnboundedSender<()>,
     _transcription_done_rx: Option<mpsc::UnboundedReceiver<()>>,
 
@@ -210,6 +228,7 @@ pub struct RealTimeTranscriber {
 
     // Task handles for graceful shutdown
     transcription_handle: Option<tokio::task::JoinHandle<()>>,
+    streaming_handle: Option<tokio::task::JoinHandle<()>>,
     audio_handle: Option<tokio::task::JoinHandle<()>>,
     backend_load_handle: Option<tokio::task::JoinHandle<()>>,
     backend_manager_handle: Option<tokio::task::JoinHandle<()>>,
@@ -265,6 +284,7 @@ impl RealTimeTranscriber {
         let (tx, rx) = mpsc::channel(400);
         let (transcript_tx, transcript_rx) = broadcast::channel(100);
         let (segment_tx, segment_rx) = mpsc::channel(400);
+        let (stream_tx, stream_rx) = mpsc::channel(400);
         let (transcription_done_tx, transcription_done_rx) = mpsc::unbounded_channel();
         let (manual_session_tx, manual_session_rx) = mpsc::channel(10);
 
@@ -326,6 +346,7 @@ impl RealTimeTranscriber {
             BackendType::WhisperCpp => "WhisperCpp",
             BackendType::Moonshine => "Moonshine",
             BackendType::Parakeet => "Parakeet",
+            BackendType::Nemotron => "Nemotron",
         };
         let backend_status = Arc::new(RwLock::new(BackendStatus::new(
             backend_name.to_string(),
@@ -432,11 +453,14 @@ impl RealTimeTranscriber {
             audio_visualization_data,
             segment_tx,
             segment_rx: Some(segment_rx),
+            stream_tx,
+            stream_rx: Some(stream_rx),
             transcription_done_tx,
             _transcription_done_rx: Some(transcription_done_rx),
             transcription_stats,
             stats_reporter: None,
             transcription_handle: None,
+            streaming_handle: None,
             audio_handle: None,
             backend_load_handle: Some(backend_load_handle),
             backend_manager_handle: Some(backend_manager_handle),
@@ -514,6 +538,7 @@ impl RealTimeTranscriber {
             self.transcription_mode.clone(),
             self.transcription_stats.clone(),
             self.manual_session_tx.clone(),
+            self.stream_tx.clone(),
             (*self.app_config).clone(),
         ));
 
@@ -528,6 +553,11 @@ impl RealTimeTranscriber {
         ) {
             self.transcription_handle =
                 Some(transcription_processor.start(segment_rx, self.transcript_tx.clone()));
+            if let Some(stream_rx) = self.stream_rx.take() {
+                self.streaming_handle = Some(
+                    transcription_processor.start_streaming(stream_rx, self.transcript_tx.clone()),
+                );
+            }
             self.audio_handle = Some(audio_processor.start(rx));
             self.start_recording_monitor();
             self.start_manual_session_processor(manual_session_rx);
@@ -1156,6 +1186,12 @@ impl RealTimeTranscriber {
 
         if let Some(handle) = self.audio_handle.take() {
             Self::wait_for_task(handle, "Audio processor", shutdown_timeout).await;
+        }
+
+        // Streaming worker holds no durable state; abort rather than waiting on
+        // its blocking recv loop.
+        if let Some(handle) = self.streaming_handle.take() {
+            handle.abort();
         }
 
         if let Some(handle) = self.transcription_handle.take() {

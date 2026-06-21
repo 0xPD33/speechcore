@@ -14,9 +14,12 @@ pub mod ctranslate2;
 pub mod factory;
 #[cfg(feature = "backend-moonshine")]
 pub mod moonshine;
+#[cfg(feature = "backend-nemotron")]
+pub mod nemotron;
 #[cfg(any(
     feature = "backend-moonshine",
     feature = "backend-parakeet",
+    feature = "backend-nemotron",
     feature = "vad-silero"
 ))]
 pub mod onnx_utils;
@@ -47,6 +50,10 @@ pub enum BackendType {
 
     /// NVIDIA Parakeet backend (future)
     Parakeet,
+
+    /// NVIDIA Nemotron 3.5 ASR streaming backend
+    #[serde(alias = "nemotron")]
+    Nemotron,
 }
 
 #[allow(clippy::derivable_impls)]
@@ -96,6 +103,7 @@ impl fmt::Display for BackendType {
             BackendType::WhisperCpp => write!(f, "whisper_cpp"),
             BackendType::Moonshine => write!(f, "moonshine"),
             BackendType::Parakeet => write!(f, "parakeet"),
+            BackendType::Nemotron => write!(f, "nemotron"),
         }
     }
 }
@@ -193,6 +201,10 @@ pub enum TranscriptionBackend {
     /// Parakeet TDT backend
     #[cfg(feature = "backend-parakeet")]
     Parakeet(Box<parakeet::ParakeetBackend>),
+
+    /// Nemotron 3.5 ASR streaming backend
+    #[cfg(feature = "backend-nemotron")]
+    Nemotron(Box<nemotron::NemotronBackend>),
 }
 
 impl TranscriptionBackend {
@@ -207,11 +219,14 @@ impl TranscriptionBackend {
             TranscriptionBackend::Moonshine(_) => BackendType::Moonshine,
             #[cfg(feature = "backend-parakeet")]
             TranscriptionBackend::Parakeet(_) => BackendType::Parakeet,
+            #[cfg(feature = "backend-nemotron")]
+            TranscriptionBackend::Nemotron(_) => BackendType::Nemotron,
             #[cfg(all(
                 not(feature = "backend-ctranslate2"),
                 not(feature = "backend-whisper-cpp"),
                 not(feature = "backend-moonshine"),
-                not(feature = "backend-parakeet")
+                not(feature = "backend-parakeet"),
+                not(feature = "backend-nemotron")
             ))]
             _ => unreachable!("no transcription backend variants are enabled"),
         }
@@ -228,14 +243,55 @@ impl TranscriptionBackend {
             TranscriptionBackend::Moonshine(backend) => backend.capabilities(),
             #[cfg(feature = "backend-parakeet")]
             TranscriptionBackend::Parakeet(backend) => backend.capabilities(),
+            #[cfg(feature = "backend-nemotron")]
+            TranscriptionBackend::Nemotron(backend) => backend.capabilities(),
             #[cfg(all(
                 not(feature = "backend-ctranslate2"),
                 not(feature = "backend-whisper-cpp"),
                 not(feature = "backend-moonshine"),
-                not(feature = "backend-parakeet")
+                not(feature = "backend-parakeet"),
+                not(feature = "backend-nemotron")
             ))]
             _ => unreachable!("no transcription backend variants are enabled"),
         }
+    }
+
+    /// Whether this backend supports incremental streaming transcription.
+    pub fn supports_streaming(&self) -> bool {
+        self.capabilities().supports_streaming
+    }
+
+    /// Begin a streaming utterance (no-op for non-streaming backends).
+    pub fn stream_reset(
+        &self,
+        language: &str,
+        nemotron_options: &crate::config::NemotronOptions,
+    ) -> Result<(), TranscriptionError> {
+        #[cfg(feature = "backend-nemotron")]
+        if let TranscriptionBackend::Nemotron(b) = self {
+            return b.stream_reset(language, nemotron_options);
+        }
+        let _ = (language, nemotron_options);
+        Ok(())
+    }
+
+    /// Feed a streaming audio chunk; returns the cumulative partial transcript.
+    pub fn stream_push(&self, samples: &[f32]) -> Result<String, TranscriptionError> {
+        #[cfg(feature = "backend-nemotron")]
+        if let TranscriptionBackend::Nemotron(b) = self {
+            return b.stream_push(samples);
+        }
+        let _ = samples;
+        Ok(String::new())
+    }
+
+    /// Finish the streaming utterance, flushing the trailing partial.
+    pub fn stream_finish(&self) -> Result<String, TranscriptionError> {
+        #[cfg(feature = "backend-nemotron")]
+        if let TranscriptionBackend::Nemotron(b) = self {
+            return b.stream_finish();
+        }
+        Ok(String::new())
     }
 }
 
@@ -245,7 +301,8 @@ pub use traits::TranscriptionError;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    #[cfg(feature = "backend-ctranslate2")]
+    use super::{BackendConfig, BackendType};
 
     #[test]
     #[cfg(feature = "backend-ctranslate2")]

@@ -22,24 +22,23 @@ behavior.
 - Model cache and download helpers.
 - Transcript and backend status streams for app-owned UI or service logic.
 
-## Feature Flags
+## Installing
 
-The default feature set enables the runtime plus CTranslate2, Moonshine, and
-Parakeet backends:
+The default crate has no heavy native runtime features enabled. Applications
+should opt into the runtime and the backend they want:
 
 ```toml
-speechcore = { path = "../speechcore" }
+speechcore = { version = "0.1", default-features = false, features = ["runtime", "backend-whisper-cpp"] }
 ```
 
 For a separate application repository, depend on the standalone repository once
-it has been pushed. Replace the URL with the repository location you publish:
+it has been pushed:
 
 ```toml
-speechcore = { git = "https://github.com/your-org/speechcore", default-features = false, features = ["runtime", "backend-whisper-cpp"] }
+speechcore = { git = "https://github.com/0xPD33/speechcore", default-features = false, features = ["runtime", "backend-whisper-cpp"] }
 ```
 
-For applications that want a smaller dependency graph, disable defaults and opt
-into only the pieces you need:
+For local development from this workspace:
 
 ```toml
 speechcore = {
@@ -49,11 +48,14 @@ speechcore = {
 }
 ```
 
+## Feature Flags
+
 Available features:
 
 | Feature | Enables |
 | --- | --- |
 | `runtime` | `SpeechEngine`, `RealTimeTranscriber`, audio processing, VAD runtime, model downloads, WAV debug output |
+| `all-backends` | CTranslate2, Moonshine, Parakeet, and whisper.cpp backends |
 | `audio-capture` | PortAudio microphone capture |
 | `vad-silero` | Silero VAD via ONNX Runtime |
 | `model-downloads` | model cache and download helpers |
@@ -121,9 +123,13 @@ Recommended checks before publishing or opening a PR:
 
 ```bash
 cargo fmt --all -- --check
+cargo check
 cargo test --no-default-features
-cargo test
-cargo check --features backend-whisper-cpp
+cargo check --no-default-features --features runtime
+cargo clippy --no-default-features --features runtime --all-targets -- -D warnings
+cargo test --no-default-features --features runtime,backend-ctranslate2
+cargo check --no-default-features --features runtime,all-backends
+cargo check --no-default-features --features runtime,backend-whisper-cpp --examples
 cargo doc --no-deps
 cargo package
 cargo publish --dry-run

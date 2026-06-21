@@ -304,6 +304,16 @@ impl TranscriptionProcessor {
                         segment.sample_rate,
                     )
                 }
+                #[cfg(feature = "backend-nemotron")]
+                crate::backend::TranscriptionBackend::Nemotron(nemotron_backend) => {
+                    nemotron_backend.transcribe(
+                        &segment.samples,
+                        language,
+                        &app_config.common_transcription_options,
+                        &app_config.nemotron_options,
+                        segment.sample_rate,
+                    )
+                }
             };
 
             match result {
@@ -397,6 +407,7 @@ impl TranscriptionProcessor {
                     Some(crate::real_time_transcriber::TranscriptionMessage {
                         text: transcription,
                         session_id,
+                        is_final: true,
                     })
                 }
             } else {
@@ -416,6 +427,7 @@ impl TranscriptionProcessor {
                     Some(crate::real_time_transcriber::TranscriptionMessage {
                         text: transcription,
                         session_id,
+                        is_final: true,
                     })
                 }
             }
@@ -439,6 +451,95 @@ impl TranscriptionProcessor {
                 start_time.elapsed().as_secs_f32()
             );
         }
+    }
+
+    /// Spawn the streaming worker: consumes live-audio `StreamEvent`s and emits
+    /// interim (`is_final = false`) transcripts for streaming-capable backends.
+    /// Non-streaming backends drain events and stay silent (the segment path
+    /// produces their final result as usual).
+    pub fn start_streaming(
+        &self,
+        mut stream_rx: mpsc::Receiver<crate::real_time_transcriber::StreamEvent>,
+        transcript_tx: broadcast::Sender<crate::real_time_transcriber::TranscriptionMessage>,
+    ) -> tokio::task::JoinHandle<()> {
+        use crate::real_time_transcriber::{StreamEvent, TranscriptionMessage};
+
+        let backend = self.backend.clone();
+        let backend_ready = self.backend_ready.clone();
+        let running = self.running.clone();
+        let language = self.language.clone();
+        let app_config = self.app_config.clone();
+
+        tokio::spawn(async move {
+            let mut session_id: Option<String> = None;
+            // Whether the current utterance's backend supports streaming.
+            let mut active = false;
+
+            while let Some(event) = stream_rx.recv().await {
+                if !running.load(Ordering::Relaxed) {
+                    break;
+                }
+                // Snapshot the loaded backend (None during (re)load).
+                let backend_arc = {
+                    let lock = backend.lock();
+                    lock.as_ref().map(Arc::clone)
+                };
+                let Some(b) = backend_arc else {
+                    continue;
+                };
+                if !backend_ready.load(Ordering::Relaxed) {
+                    continue;
+                }
+
+                match event {
+                    StreamEvent::Start { session_id: sid } => {
+                        session_id = sid;
+                        active = b.supports_streaming();
+                        if active {
+                            let lang = language.clone();
+                            let opts = app_config.nemotron_options.clone();
+                            let _ =
+                                tokio::task::spawn_blocking(move || b.stream_reset(&lang, &opts))
+                                    .await;
+                        }
+                    }
+                    StreamEvent::Chunk(samples) => {
+                        if !active {
+                            continue;
+                        }
+                        let partial =
+                            tokio::task::spawn_blocking(move || b.stream_push(&samples)).await;
+                        if let Ok(Ok(text)) = partial {
+                            if !text.is_empty() {
+                                let _ = transcript_tx.send(TranscriptionMessage {
+                                    text,
+                                    session_id: session_id.clone(),
+                                    is_final: false,
+                                });
+                            }
+                        }
+                    }
+                    StreamEvent::End => {
+                        if !active {
+                            continue;
+                        }
+                        active = false;
+                        let final_partial =
+                            tokio::task::spawn_blocking(move || b.stream_finish()).await;
+                        if let Ok(Ok(text)) = final_partial {
+                            if !text.is_empty() {
+                                // Interim only; the segment path emits the committed final.
+                                let _ = transcript_tx.send(TranscriptionMessage {
+                                    text,
+                                    session_id: session_id.clone(),
+                                    is_final: false,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        })
     }
 
     pub fn start(

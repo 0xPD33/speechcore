@@ -227,6 +227,9 @@ pub struct SpeechConfig {
     /// Parakeet TDT-specific options
     pub parakeet_options: ParakeetOptions,
 
+    /// Nemotron 3.5 ASR-specific options
+    pub nemotron_options: NemotronOptions,
+
     /// Debug and development configuration
     pub debug_config: DebugConfig,
 
@@ -320,6 +323,23 @@ pub struct MoonshineOptions {
 #[serde(default)]
 pub struct ParakeetOptions {}
 
+/// Nemotron 3.5 ASR-specific options
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NemotronOptions {
+    /// Target language locale for the lang-ID prompt (e.g. "en-US", "de-DE",
+    /// or "auto" for built-in language detection). Empty falls back to en-US.
+    pub language: String,
+}
+
+impl Default for NemotronOptions {
+    fn default() -> Self {
+        Self {
+            language: "en-US".to_string(),
+        }
+    }
+}
+
 /// Configuration for Voice Activity Detection
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -351,6 +371,21 @@ impl Default for VadConfigSerde {
     }
 }
 
+/// Silero v5 is a stateful recurrent model and MUST be fed contiguous,
+/// non-overlapping 512-sample frames; the legacy 10ms (160-sample) hop re-fed
+/// overlapping audio and corrupted its recurrent state. So each VAD frame is now
+/// 32ms. The configured hang/tolerance frame-counts are expressed in legacy 10ms
+/// units, so rescale them to 32ms frames to preserve their intended durations.
+#[cfg(feature = "vad-silero")]
+fn rescale_vad_frames(frames: usize, frame_size: usize) -> usize {
+    const LEGACY_HOP: usize = 160;
+    if frames == 0 {
+        0
+    } else {
+        ((frames * LEGACY_HOP + frame_size / 2) / frame_size).max(1)
+    }
+}
+
 #[cfg(feature = "vad-silero")]
 impl SileroVadConfig {
     pub fn from_config(
@@ -359,17 +394,21 @@ impl SileroVadConfig {
         _buffer_size: usize,
         sample_rate: usize,
     ) -> Self {
+        let frame_size = 512;
         Self {
             threshold: vad_config.sensitivity.threshold(),
-            frame_size: 512,
+            frame_size,
             sample_rate,
-            hangbefore_frames: vad_config.hangbefore_frames,
-            hangover_frames: vad_config.hangover_frames,
-            hop_samples: (sample_rate as f32 * 0.01) as usize, // 10ms hop calculated from sample_rate
+            hangbefore_frames: rescale_vad_frames(vad_config.hangbefore_frames, frame_size),
+            hangover_frames: rescale_vad_frames(vad_config.hangover_frames, frame_size),
+            hop_samples: frame_size, // non-overlapping: feed Silero contiguous 512-sample frames
             max_buffer_duration: (realtime_config.max_buffer_duration_sec * sample_rate as f32)
                 as usize,
             max_segment_count: realtime_config.max_segment_count,
-            silence_tolerance_frames: vad_config.silence_tolerance_frames,
+            silence_tolerance_frames: rescale_vad_frames(
+                vad_config.silence_tolerance_frames,
+                frame_size,
+            ),
             speech_end_threshold: vad_config.sensitivity.speech_end_threshold(),
             speech_prob_smoothing: vad_config.speech_prob_smoothing,
         }
@@ -386,17 +425,21 @@ impl From<(VadConfigSerde, RealtimeModeConfig, usize, usize)> for SileroVadConfi
             usize,
         ),
     ) -> Self {
+        let frame_size = 512;
         Self {
             threshold: config.sensitivity.threshold(),
-            frame_size: 512,
+            frame_size,
             sample_rate,
-            hangbefore_frames: config.hangbefore_frames,
-            hangover_frames: config.hangover_frames,
-            hop_samples: (sample_rate as f32 * 0.01) as usize, // 10ms hop calculated from sample_rate
+            hangbefore_frames: rescale_vad_frames(config.hangbefore_frames, frame_size),
+            hangover_frames: rescale_vad_frames(config.hangover_frames, frame_size),
+            hop_samples: frame_size, // non-overlapping: feed Silero contiguous 512-sample frames
             max_buffer_duration: (realtime_config.max_buffer_duration_sec * sample_rate as f32)
                 as usize,
             max_segment_count: realtime_config.max_segment_count,
-            silence_tolerance_frames: config.silence_tolerance_frames,
+            silence_tolerance_frames: rescale_vad_frames(
+                config.silence_tolerance_frames,
+                frame_size,
+            ),
             speech_end_threshold: config.sensitivity.speech_end_threshold(),
             speech_prob_smoothing: config.speech_prob_smoothing,
         }

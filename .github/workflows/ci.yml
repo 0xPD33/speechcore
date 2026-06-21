@@ -32,10 +32,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Check minimal API
-        run: cargo check --no-default-features
+        run: cargo check
 
       - name: Lint minimal API
-        run: cargo clippy --no-default-features --all-targets -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Test minimal API
         run: cargo test --no-default-features
@@ -46,17 +46,20 @@ jobs:
       - name: Lint runtime API without backends
         run: cargo clippy --no-default-features --features runtime --all-targets -- -D warnings
 
-      - name: Check default features
-        run: cargo check
+      - name: Check runtime API with all backends
+        run: cargo check --no-default-features --features runtime,all-backends
 
-      - name: Lint default features
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: Test default features
-        run: cargo test
+      - name: Test CTranslate2 runtime path
+        run: cargo test --no-default-features --features runtime,backend-ctranslate2
 
       - name: Check examples
-        run: cargo check --examples
+        run: cargo check --no-default-features --features runtime,backend-whisper-cpp --examples
 
       - name: Check optional Whisper.cpp backend
         run: cargo check --no-default-features --features backend-whisper-cpp
+
+      - name: Build documentation
+        run: cargo doc --no-deps
+
+      - name: Verify package
+        run: cargo package
