@@ -37,10 +37,11 @@ jobs:
         # CTranslate2's protobuf at link time (duplicate symbols).
         run: |
           ORT_VERSION=1.22.0
-          curl -fsSL -o ort.tgz "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz"
-          tar -xzf ort.tgz
-          sudo cp -r "onnxruntime-linux-x64-${ORT_VERSION}/lib/." /usr/local/lib/
-          sudo cp -r "onnxruntime-linux-x64-${ORT_VERSION}/include/." /usr/local/include/
+          tmp="$(mktemp -d)"
+          curl -fsSL -o "$tmp/ort.tgz" "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz"
+          tar -xzf "$tmp/ort.tgz" -C "$tmp"
+          sudo cp -r "$tmp/onnxruntime-linux-x64-${ORT_VERSION}/lib/." /usr/local/lib/
+          sudo cp -r "$tmp/onnxruntime-linux-x64-${ORT_VERSION}/include/." /usr/local/include/
           sudo ldconfig
           {
             echo "ORT_STRATEGY=system"
