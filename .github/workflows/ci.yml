@@ -46,6 +46,8 @@ jobs:
             echo "ORT_STRATEGY=system"
             echo "ORT_LIB_LOCATION=/usr/local/lib"
             echo "OPENBLAS_PATH=/usr"
+            echo "LIBRARY_PATH=/usr/local/lib"
+            echo "LD_LIBRARY_PATH=/usr/local/lib"
           } >> "$GITHUB_ENV"
 
       - name: Format
