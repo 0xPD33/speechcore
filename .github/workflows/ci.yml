@@ -27,6 +27,10 @@ jobs:
             pkg-config \
             portaudio19-dev
 
+      - name: Configure OpenBLAS headers
+        # whisper-rs-sys (openblas feature) requires this to be set explicitly.
+        run: echo "BLAS_INCLUDE_DIRS=$(dirname "$(dpkg -L libopenblas-dev | grep -m1 '/cblas.h$')")" >> "$GITHUB_ENV"
+
       - name: Format
         run: cargo fmt --all -- --check
 
