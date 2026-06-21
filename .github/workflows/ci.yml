@@ -31,6 +31,23 @@ jobs:
         # whisper-rs-sys (openblas feature) requires this to be set explicitly.
         run: echo "BLAS_INCLUDE_DIRS=$(dirname "$(dpkg -L libopenblas-dev | grep -m1 '/cblas.h$')")" >> "$GITHUB_ENV"
 
+      - name: Install ONNX Runtime (system)
+        # Use a system onnxruntime so ort links it dynamically. The default
+        # downloaded static build bundles protobuf, which collides with
+        # CTranslate2's protobuf at link time (duplicate symbols).
+        run: |
+          ORT_VERSION=1.22.0
+          curl -fsSL -o ort.tgz "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz"
+          tar -xzf ort.tgz
+          sudo cp -r "onnxruntime-linux-x64-${ORT_VERSION}/lib/." /usr/local/lib/
+          sudo cp -r "onnxruntime-linux-x64-${ORT_VERSION}/include/." /usr/local/include/
+          sudo ldconfig
+          {
+            echo "ORT_STRATEGY=system"
+            echo "ORT_LIB_LOCATION=/usr/local/lib"
+            echo "OPENBLAS_PATH=/usr"
+          } >> "$GITHUB_ENV"
+
       - name: Format
         run: cargo fmt --all -- --check
 
