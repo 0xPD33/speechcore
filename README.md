@@ -18,6 +18,7 @@ behavior.
   - CTranslate2
   - Moonshine ONNX
   - NVIDIA Parakeet ONNX
+  - NVIDIA Nemotron 3.5 ASR ONNX (streaming: cache-aware FastConformer + RNNT, with low-latency partials)
   - whisper.cpp via `whisper-rs` when explicitly enabled
 - Model cache and download helpers.
 - Transcript and backend status streams for app-owned UI or service logic.
@@ -35,7 +36,7 @@ For a separate application repository, depend on the standalone repository once
 it has been pushed:
 
 ```toml
-speechcore = { git = "https://github.com/0xPD33/speechcore", default-features = false, features = ["runtime", "backend-whisper-cpp"] }
+speechcore = { git = "https://github.com/0xPD33/speechcore", tag = "v0.1.0", default-features = false, features = ["runtime", "backend-whisper-cpp"] }
 ```
 
 For local development from this workspace:
@@ -55,7 +56,7 @@ Available features:
 | Feature | Enables |
 | --- | --- |
 | `runtime` | `SpeechEngine`, `RealTimeTranscriber`, audio processing, VAD runtime, model downloads, WAV debug output |
-| `all-backends` | CTranslate2, Moonshine, Parakeet, and whisper.cpp backends |
+| `all-backends` | CTranslate2, Moonshine, Parakeet, Nemotron, and whisper.cpp backends |
 | `audio-capture` | PortAudio microphone capture |
 | `vad-silero` | Silero VAD via ONNX Runtime |
 | `model-downloads` | model cache and download helpers |
@@ -63,6 +64,7 @@ Available features:
 | `backend-ctranslate2` | CTranslate2 backend via `ct2rs` |
 | `backend-moonshine` | Moonshine ONNX backend |
 | `backend-parakeet` | Parakeet ONNX backend |
+| `backend-nemotron` | Nemotron 3.5 ASR streaming ONNX backend |
 | `backend-whisper-cpp` | whisper.cpp backend via `whisper-rs` |
 | `ort-cuda` | ONNX Runtime CUDA execution provider |
 | `ort-tensorrt` | ONNX Runtime TensorRT execution provider |
@@ -110,6 +112,29 @@ Some features need native libraries:
 
 On NixOS or other declarative environments, prefer project-local shells or
 flakes that pin these dependencies.
+
+### ONNX Runtime + CTranslate2 (important)
+
+`ort` (used by the ONNX backends and Silero VAD) downloads a **static** ONNX
+Runtime by default. That static build bundles protobuf, which **collides with
+CTranslate2's protobuf at link time** (duplicate `google::protobuf::*` symbols)
+whenever both are enabled — and `runtime` enables Silero VAD (ort), so this hits
+any `runtime` + `backend-ctranslate2` build. Link a **system** ONNX Runtime so it
+is loaded dynamically instead:
+
+```bash
+# Install ONNX Runtime (matching ort's expected version, e.g. 1.22.x) to /usr/local, then:
+export ORT_STRATEGY=system
+export ORT_LIB_LOCATION=/usr/local/lib
+export LIBRARY_PATH=/usr/local/lib       # link-time resolution of -lonnxruntime
+export LD_LIBRARY_PATH=/usr/local/lib    # run-time loading
+# OpenBLAS (whisper.cpp `openblas` feature) needs its headers located:
+export BLAS_INCLUDE_DIRS=/usr/include/x86_64-linux-gnu
+export OPENBLAS_PATH=/usr
+```
+
+The Nix flake sets this up automatically; `.github/workflows/ci.yml` is a
+known-good Ubuntu reference for the native dependencies and env vars.
 
 ## Model Cache
 
