@@ -37,12 +37,13 @@ native dependencies that determine real platform support:
 | Target | Status |
 | --- | --- |
 | Linux x86_64 | ✅ Tested (CI + development) |
-| macOS | ⚠️ Untested — the ONNX backends are most likely to build; `backend-whisper-cpp` needs MoltenVK for its `vulkan` feature |
+| macOS | ⚠️ Untested — the ONNX backends and plain-CPU whisper.cpp are most likely to build |
 | Windows | ⚠️ Untested — expect native-build friction; set `SPEECHCORE_MODEL_DIR` (or `HOME`/`XDG_CACHE_HOME`) as the model cache falls back to `$HOME/.cache` |
 | ARM (Apple Silicon / ARM Linux) | ⚠️ Untested |
 
-- `backend-whisper-cpp` builds whisper.cpp with the `vulkan` and `openblas`
-  features, so it needs the Vulkan SDK (`glslc`) and OpenBLAS.
+- `backend-whisper-cpp` builds plain CPU whisper.cpp by default (portable).
+  Acceleration is opt-in: `whisper-cpp-vulkan` needs the Vulkan SDK (`glslc`),
+  `whisper-cpp-openblas` needs OpenBLAS.
 - The ONNX backends and Silero VAD use `ort`, which downloads a per-platform ONNX
   Runtime by default; combining them with `backend-ctranslate2` requires a
   **system** ONNX Runtime (see [ONNX Runtime + CTranslate2](#onnx-runtime--ctranslate2-important)).
@@ -62,7 +63,7 @@ speechcore = { version = "0.1", default-features = false, features = ["runtime",
 To track a specific Git revision or tag instead of the crates.io release:
 
 ```toml
-speechcore = { git = "https://github.com/0xPD33/speechcore", tag = "v0.1.0", default-features = false, features = ["runtime", "backend-whisper-cpp"] }
+speechcore = { git = "https://github.com/0xPD33/speechcore", tag = "v0.1.1", default-features = false, features = ["runtime", "backend-whisper-cpp"] }
 ```
 
 For local development from this workspace:
@@ -91,7 +92,9 @@ Available features:
 | `backend-moonshine` | Moonshine ONNX backend |
 | `backend-parakeet` | Parakeet ONNX backend |
 | `backend-nemotron` | Nemotron 3.5 ASR streaming ONNX backend |
-| `backend-whisper-cpp` | whisper.cpp backend via `whisper-rs` |
+| `backend-whisper-cpp` | whisper.cpp backend via `whisper-rs` (plain CPU) |
+| `whisper-cpp-vulkan` | whisper.cpp Vulkan acceleration (needs Vulkan SDK / `glslc`) |
+| `whisper-cpp-openblas` | whisper.cpp OpenBLAS acceleration (needs OpenBLAS) |
 | `ort-cuda` | ONNX Runtime CUDA execution provider |
 | `ort-tensorrt` | ONNX Runtime TensorRT execution provider |
 

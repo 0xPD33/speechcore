@@ -81,6 +81,9 @@ jobs:
       - name: Check optional Whisper.cpp backend
         run: cargo check --no-default-features --features backend-whisper-cpp
 
+      - name: Check Whisper.cpp acceleration features
+        run: cargo check --no-default-features --features runtime,whisper-cpp-vulkan,whisper-cpp-openblas
+
       - name: Build documentation
         run: cargo doc --no-deps
 

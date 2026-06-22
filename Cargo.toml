@@ -1,6 +1,6 @@
 [package]
 name = "speechcore"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Reusable Rust speech-to-text runtime with audio capture, VAD, backend selection, model provisioning, and transcript streaming."
 license = "MIT OR Apache-2.0"
@@ -30,7 +30,7 @@ rustfft = { version = "6.4", optional = true }
 ort = { version = "2.0.0-rc.10", features = ["ndarray"], optional = true }
 chrono = "0.4"
 num_cpus = "1"
-whisper-rs = { version = "0.15.1", features = ["openblas", "vulkan"], optional = true }
+whisper-rs = { version = "0.15.1", optional = true }
 hound = { version = "3.5", optional = true }
 tokenizers = { version = "0.22", optional = true }
 tracing = "0.1"
@@ -63,6 +63,10 @@ backend-moonshine = ["dep:ort", "dep:ndarray", "dep:serde_json", "dep:tokenizers
 backend-parakeet = ["dep:ort", "dep:ndarray", "dep:rustfft"]
 backend-nemotron = ["dep:ort", "dep:ndarray", "dep:rustfft", "model-downloads"]
 backend-whisper-cpp = ["dep:whisper-rs", "model-downloads"]
+# Optional whisper.cpp acceleration (opt-in; base backend builds plain CPU so it
+# works on systems without the Vulkan SDK / OpenBLAS).
+whisper-cpp-vulkan = ["backend-whisper-cpp", "whisper-rs/vulkan"]
+whisper-cpp-openblas = ["backend-whisper-cpp", "whisper-rs/openblas"]
 ort-cpu = ["dep:ort"]
 ort-cuda = ["dep:ort", "ort/cuda"]
 ort-tensorrt = ["dep:ort", "ort/tensorrt"]
