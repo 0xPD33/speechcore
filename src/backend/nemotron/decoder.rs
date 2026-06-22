@@ -61,6 +61,8 @@ pub fn decode_frames(
     Ok(())
 }
 
+// (decoder_output, h_out, c_out)
+#[allow(clippy::type_complexity)]
 fn run_decoder(
     decoder: &Mutex<Session>,
     token: i64,

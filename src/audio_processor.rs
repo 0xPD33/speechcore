@@ -258,19 +258,23 @@ impl AudioProcessor {
                             TranscriptionMode::RealTime => latest_is_speaking,
                             TranscriptionMode::Manual => false,
                         };
+                        // Start/End are control events and must be delivered (await).
+                        // Chunks are best-effort: drop on a full channel via try_send
+                        // so a lagging streaming worker can never stall this audio
+                        // loop (which would delay capture reads -> gappy audio/VAD).
+                        // Dropped chunks only stale the live preview; the segment path
+                        // still produces the authoritative final.
                         if utterance_active && !stream_active {
                             let sid = session_id_ref.read().clone();
                             let _ = stream_tx.send(StreamEvent::Start { session_id: sid }).await;
                             // Seed with preroll context (already includes this chunk).
                             let preroll: Vec<f32> = preroll_buffer.iter().copied().collect();
                             if !preroll.is_empty() {
-                                let _ = stream_tx.send(StreamEvent::Chunk(preroll)).await;
+                                let _ = stream_tx.try_send(StreamEvent::Chunk(preroll));
                             }
                             stream_active = true;
                         } else if utterance_active {
-                            let _ = stream_tx
-                                .send(StreamEvent::Chunk(audio_buffer.clone()))
-                                .await;
+                            let _ = stream_tx.try_send(StreamEvent::Chunk(audio_buffer.clone()));
                         } else if stream_active {
                             let _ = stream_tx.send(StreamEvent::End).await;
                             stream_active = false;

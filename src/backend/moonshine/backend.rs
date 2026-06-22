@@ -51,7 +51,8 @@ impl MoonshineBackend {
             name: "Moonshine",
             max_audio_duration: None,
             supported_languages: None,
-            supports_streaming: true,
+            // No incremental stream_* implementation; only Nemotron streams today.
+            supports_streaming: false,
             gpu_available: self.config.gpu_enabled,
         }
     }

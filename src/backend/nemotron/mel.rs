@@ -119,7 +119,7 @@ fn reflect_pad(x: &[f32], p: usize) -> Vec<f32> {
         // Degenerate (very short) input: just zero-pad, avoids OOB reflect.
         let mut out = vec![0.0; p];
         out.extend_from_slice(x);
-        out.extend(std::iter::repeat(0.0).take(p));
+        out.extend(std::iter::repeat_n(0.0, p));
         return out;
     }
     let mut out = Vec::with_capacity(n + 2 * p);
