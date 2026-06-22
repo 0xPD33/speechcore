@@ -1,5 +1,10 @@
 # speechcore
 
+[![crates.io](https://img.shields.io/crates/v/speechcore.svg)](https://crates.io/crates/speechcore)
+[![docs.rs](https://img.shields.io/docsrs/speechcore)](https://docs.rs/speechcore)
+[![CI](https://github.com/0xPD33/speechcore/actions/workflows/ci.yml/badge.svg)](https://github.com/0xPD33/speechcore/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/crates/l/speechcore.svg)](#license)
+
 Reusable Rust speech-to-text runtime components for desktop and service
 applications.
 
@@ -23,17 +28,38 @@ behavior.
 - Model cache and download helpers.
 - Transcript and backend status streams for app-owned UI or service logic.
 
+## Platform Support
+
+Developed and CI-tested on **Linux x86_64** (Ubuntu in CI, NixOS in dev). The
+pure-Rust API (default features, no backends) is portable, but each backend pulls
+native dependencies that determine real platform support:
+
+| Target | Status |
+| --- | --- |
+| Linux x86_64 | ✅ Tested (CI + development) |
+| macOS | ⚠️ Untested — the ONNX backends are most likely to build; `backend-whisper-cpp` needs MoltenVK for its `vulkan` feature |
+| Windows | ⚠️ Untested — expect native-build friction; set `SPEECHCORE_MODEL_DIR` (or `HOME`/`XDG_CACHE_HOME`) as the model cache falls back to `$HOME/.cache` |
+| ARM (Apple Silicon / ARM Linux) | ⚠️ Untested |
+
+- `backend-whisper-cpp` builds whisper.cpp with the `vulkan` and `openblas`
+  features, so it needs the Vulkan SDK (`glslc`) and OpenBLAS.
+- The ONNX backends and Silero VAD use `ort`, which downloads a per-platform ONNX
+  Runtime by default; combining them with `backend-ctranslate2` requires a
+  **system** ONNX Runtime (see [ONNX Runtime + CTranslate2](#onnx-runtime--ctranslate2-important)).
+
+Contributions to validate or fix other platforms are welcome.
+
 ## Installing
 
-The default crate has no heavy native runtime features enabled. Applications
-should opt into the runtime and the backend they want:
+Published on [crates.io](https://crates.io/crates/speechcore). The default crate
+has no heavy native runtime features enabled — opt into the runtime and the
+backend(s) you want:
 
 ```toml
 speechcore = { version = "0.1", default-features = false, features = ["runtime", "backend-whisper-cpp"] }
 ```
 
-For a separate application repository, depend on the standalone repository once
-it has been pushed:
+To track a specific Git revision or tag instead of the crates.io release:
 
 ```toml
 speechcore = { git = "https://github.com/0xPD33/speechcore", tag = "v0.1.0", default-features = false, features = ["runtime", "backend-whisper-cpp"] }
