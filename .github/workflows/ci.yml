@@ -10,8 +10,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned to match rust-toolchain.toml, and kept in lockstep with
+      # sonori's pin. A moving channel drifts from whatever the consuming
+      # project builds with, so lints land on the runner instead of locally.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.97.1"
           components: rustfmt, clippy
 
       - name: Install native dependencies

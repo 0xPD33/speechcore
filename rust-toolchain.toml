@@ -1,0 +1,6 @@
+[toolchain]
+# Kept in lockstep with sonori's pin so both repos, and their CI, lint and
+# build against byte-identical toolchains. Bump the two together.
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
+targets = []
