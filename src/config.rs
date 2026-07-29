@@ -146,6 +146,18 @@ pub struct PostProcessConfig {
     pub remove_trailing_dashes: bool,
     /// Normalize whitespace (collapse multiple spaces, remove leading/trailing)
     pub normalize_whitespace: bool,
+    /// Drop standalone filler words such as "um" and "uh"
+    pub remove_fillers: bool,
+    /// Collapse an immediately repeated word ("the the" -> "the").
+    /// Off by default: doubles like "had had" and "that that" are legitimate.
+    pub collapse_repeated_words: bool,
+    /// Capitalize the first letter of each sentence.
+    /// Off by default: every current backend already capitalizes, and it is
+    /// wrong when dictating shell commands.
+    pub capitalize_sentences: bool,
+    /// Append a full stop when the text ends without terminal punctuation.
+    /// Off by default for the same reason as `capitalize_sentences`.
+    pub ensure_terminal_punctuation: bool,
 }
 
 impl Default for PostProcessConfig {
@@ -155,6 +167,10 @@ impl Default for PostProcessConfig {
             remove_leading_dashes: true,
             remove_trailing_dashes: true,
             normalize_whitespace: true,
+            remove_fillers: true,
+            collapse_repeated_words: false,
+            capitalize_sentences: false,
+            ensure_terminal_punctuation: false,
         }
     }
 }
