@@ -1,6 +1,6 @@
 [package]
 name = "speechcore"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Reusable Rust speech-to-text runtime with audio capture, VAD, backend selection, model provisioning, and transcript streaming."
 license = "MIT OR Apache-2.0"
