@@ -1096,6 +1096,7 @@ impl RealTimeTranscriber {
     fn start_recording_monitor(&mut self) {
         let running = self.running.clone();
         let recording = self.recording.clone();
+        let audio_capture = self.audio_capture.clone();
 
         // We need a way to communicate with the audio capture from the monitoring task
         // For now, we'll create a simple polling mechanism
@@ -1117,6 +1118,17 @@ impl RealTimeTranscriber {
                         current_recording_state
                     );
                     last_recording_state = current_recording_state;
+                    continue;
+                }
+
+                // Watch for the device dying mid-session (unplug, audio server
+                // restart, suspend). Only once the recording state has been
+                // stable for a tick, so the normal start_recording transition
+                // is never mistaken for a failure.
+                if current_recording_state {
+                    if let Err(e) = audio_capture.lock().recover_if_stalled() {
+                        tracing::error!("Failed to recover audio input: {}", e);
+                    }
                 }
             }
 
