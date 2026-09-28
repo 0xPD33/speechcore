@@ -34,6 +34,11 @@ pub struct AudioCapture {
     callback_seen: Option<(usize, Instant)>,
     /// Rate-limits recovery so a permanently absent device does not spin.
     last_recovery_attempt: Option<Instant>,
+    /// Part of the input device name to record from; the default device when unset.
+    input_device: Option<String>,
+    /// Whether the caller wants the mic open. Stall recovery only reopens
+    /// the device while this is set, so a stopped mic stays closed.
+    wants_stream: bool,
 }
 
 impl AudioCapture {
@@ -52,7 +57,16 @@ impl AudioCapture {
             stream_params: None,
             callback_seen: None,
             last_recovery_attempt: None,
+            wants_stream: false,
+            input_device: None,
         }
+    }
+
+    /// Records from the first input device whose name contains `name`,
+    /// ignoring case. `None` keeps the system default.
+    pub fn with_input_device(mut self, name: Option<String>) -> Self {
+        self.input_device = name.filter(|name| !name.trim().is_empty());
+        self
     }
 
     /// Initializes PortAudio settings without starting the stream
@@ -65,10 +79,13 @@ impl AudioCapture {
         let pa = pa::PortAudio::new()
             .map_err(|e| anyhow::anyhow!("Failed to initialize PortAudio: {}", e))?;
 
-        let input_params = pa
-            .default_input_stream_params::<f32>(1)
-            .map_err(|e| anyhow::anyhow!("Failed to get default input stream parameters: {}", e))?;
-        tracing::debug!("Default input device resolved");
+        let input_params = match &self.input_device {
+            Some(name) => named_input_params(&pa, name)?,
+            None => pa.default_input_stream_params::<f32>(1).map_err(|e| {
+                anyhow::anyhow!("Failed to get default input stream parameters: {}", e)
+            })?,
+        };
+        tracing::debug!("Input device resolved");
 
         let frames_per_buffer = u32::try_from(self.buffer_size)
             .map_err(|_| anyhow::anyhow!("Audio buffer size too large: {}", self.buffer_size))?;
@@ -84,7 +101,8 @@ impl AudioCapture {
         Ok(())
     }
 
-    /// Starts audio capture
+    /// Stores what the stream needs. The device opens on `start_recording`,
+    /// so the mic stays closed until a recording starts.
     ///
     /// # Arguments
     /// * `tx` - Channel sender for audio samples
@@ -106,7 +124,7 @@ impl AudioCapture {
             recording,
             transcription_stats,
         });
-        self.open_stream()
+        Ok(())
     }
 
     /// Opens the input stream from the parameters captured by `start`.
@@ -199,6 +217,7 @@ impl AudioCapture {
     /// ~20 ms, and it means a changed default input device is picked up
     /// without restarting the application.
     pub fn start_recording(&mut self) -> Result<(), anyhow::Error> {
+        self.wants_stream = true;
         self.reopen()?;
         self.try_start_stream()?;
         self.callback_seen = None;
@@ -226,9 +245,7 @@ impl AudioCapture {
     /// full terminate/initialize cycle. Reopening just the stream is not
     /// enough — dropping the `PortAudio` handle is what terminates it.
     fn reopen(&mut self) -> Result<(), anyhow::Error> {
-        // Abort rather than drain: the device we are tearing down is the one
-        // that just stopped responding.
-        self.close_stream(false);
+        self.close_stream();
         tracing::debug!("Reopening audio input stream");
         self.open_stream()
     }
@@ -240,6 +257,10 @@ impl AudioCapture {
     /// signal level, so silence still advances it and only a dead device stops
     /// it. Call this periodically while recording.
     pub fn recover_if_stalled(&mut self) -> Result<bool, anyhow::Error> {
+        if !self.wants_stream {
+            return Ok(false);
+        }
+
         let now = Instant::now();
 
         // Don't hammer a device that is simply not coming back.
@@ -271,15 +292,10 @@ impl AudioCapture {
         Ok(true)
     }
 
-    /// Stops the PortAudio stream when recording ends (but keeps stream object)
+    /// Closes the device when recording ends, so the mic is released.
     pub fn stop_recording(&mut self) -> Result<(), anyhow::Error> {
-        if let Some(stream) = &mut self.pa_stream {
-            if stream.is_active().unwrap_or(false) {
-                stream
-                    .stop()
-                    .map_err(|e| anyhow::anyhow!("Failed to stop recording: {}", e))?;
-            }
-        }
+        self.wants_stream = false;
+        self.close_stream();
         Ok(())
     }
 
@@ -308,7 +324,8 @@ impl AudioCapture {
     /// Completely stops and cleans up the audio capture
     /// This closes the stream and releases resources
     pub fn stop(&mut self) {
-        self.close_stream(true);
+        self.wants_stream = false;
+        self.close_stream();
         // Dropped last: it holds the sample channel open.
         self.stream_params = None;
     }
@@ -316,24 +333,17 @@ impl AudioCapture {
     /// Tears down the stream and the PortAudio instance, keeping the
     /// parameters needed to build them again.
     ///
-    /// `graceful` picks how the stream is stopped. Pa_StopStream waits for the
-    /// stream to drain and blocks forever if the device is already gone, so
-    /// the recovery path must use Pa_AbortStream instead — recovery is exactly
-    /// the case where there is nothing left to drain.
-    fn close_stream(&mut self, graceful: bool) {
+    /// Always Pa_AbortStream: Pa_StopStream waits for the stream to drain and
+    /// blocks forever when the device is already gone.
+    fn close_stream(&mut self) {
         if let Some(stream) = &mut self.pa_stream {
-            let stopped = if graceful {
-                stream.stop()
-            } else {
-                stream.abort()
-            };
-            if let Err(e) = stopped {
+            if let Err(e) = stream.abort() {
                 tracing::warn!("Failed to stop stream: {}", e);
             }
             if let Err(e) = stream.close() {
                 tracing::warn!("Failed to close stream: {}", e);
             }
-            tracing::debug!("Audio stream closed (graceful: {})", graceful);
+            tracing::debug!("Audio stream closed");
         }
         // Order matters: the stream must drop before the PortAudio handle that
         // owns it, and dropping that handle is what calls Pa_Terminate.
@@ -342,6 +352,41 @@ impl AudioCapture {
         self.input_settings = None;
         self.callback_seen = None;
     }
+}
+
+/// Stream parameters for the first input device whose name contains `name`.
+fn named_input_params(
+    pa: &pa::PortAudio,
+    name: &str,
+) -> Result<pa::StreamParameters<f32>, anyhow::Error> {
+    let wanted = name.to_lowercase();
+    let mut available = Vec::new();
+    for device in pa
+        .devices()
+        .map_err(|e| anyhow::anyhow!("Failed to list audio devices: {}", e))?
+    {
+        let Ok((index, info)) = device else {
+            continue;
+        };
+        if info.max_input_channels < 1 {
+            continue;
+        }
+        if info.name.to_lowercase().contains(&wanted) {
+            tracing::info!("Using input device: {}", info.name);
+            return Ok(pa::StreamParameters::new(
+                index,
+                1,
+                true,
+                info.default_low_input_latency,
+            ));
+        }
+        available.push(info.name.to_string());
+    }
+    Err(anyhow::anyhow!(
+        "No input device matches \"{}\". Available: {}",
+        name,
+        available.join(", ")
+    ))
 }
 
 /// Pure half of stall detection, split out so it is testable without a device.

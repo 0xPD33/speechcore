@@ -77,7 +77,8 @@ impl SpeechEngine {
     ) -> Result<Self, anyhow::Error> {
         config.general_config.transcription_mode = "manual".to_string();
 
-        let mut transcriber = RealTimeTranscriber::new(model_path, config.clone(), feedback_sink)?;
+        let mut transcriber =
+            RealTimeTranscriber::new(Some(model_path), config.clone(), feedback_sink)?;
         let transcript_rx = transcriber.get_transcript_rx();
         transcriber.start()?;
 

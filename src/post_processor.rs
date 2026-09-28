@@ -43,6 +43,11 @@ pub fn post_process_text(text: String, config: &PostProcessConfig) -> String {
         processed = capitalize_sentences(processed);
     }
 
+    // After capitalization, so a replacement keeps its exact casing ("iPhone").
+    for (from, to) in &config.replacements {
+        processed = replace_phrase(&processed, from, to);
+    }
+
     if config.ensure_terminal_punctuation {
         processed = ensure_terminal_punctuation(processed);
     }
@@ -68,17 +73,60 @@ fn word_core(token: &str) -> String {
 /// Remove standalone filler words
 ///
 /// Only whole tokens are considered, so "hmm" goes but "hmmm" and words that
-/// merely contain a filler are left alone.
+/// merely contain a filler are left alone. Line breaks survive.
 fn remove_fillers(text: String) -> String {
-    let kept: Vec<&str> = text
-        .split_whitespace()
-        .filter(|token| {
-            let core = word_core(token);
-            !FILLERS.contains(&core.as_str())
+    text.split('\n')
+        .map(|line| {
+            line.split_whitespace()
+                .filter(|token| !FILLERS.contains(&word_core(token).as_str()))
+                .collect::<Vec<_>>()
+                .join(" ")
         })
-        .collect();
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
-    kept.join(" ")
+/// Replace each whole-word occurrence of `from`, ignoring case, with `to`.
+fn replace_phrase(text: &str, from: &str, to: &str) -> String {
+    if from.trim().is_empty() {
+        return text.to_string();
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut after_word_char = false;
+    while let Some(c) = rest.chars().next() {
+        if !after_word_char {
+            if let Some(len) = case_insensitive_prefix_len(rest, from) {
+                if !rest[len..]
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_alphanumeric)
+                {
+                    out.push_str(to);
+                    after_word_char = to.chars().last().is_some_and(char::is_alphanumeric);
+                    rest = &rest[len..];
+                    continue;
+                }
+            }
+        }
+        out.push(c);
+        after_word_char = c.is_alphanumeric();
+        rest = &rest[c.len_utf8()..];
+    }
+    out
+}
+
+/// Byte length of the prefix of `text` that equals `pattern` without case.
+fn case_insensitive_prefix_len(text: &str, pattern: &str) -> Option<usize> {
+    let mut text_chars = text.char_indices();
+    for expected in pattern.chars() {
+        let (_, actual) = text_chars.next()?;
+        if !actual.to_lowercase().eq(expected.to_lowercase()) {
+            return None;
+        }
+    }
+    Some(text_chars.next().map_or(text.len(), |(index, _)| index))
 }
 
 /// Collapse a word immediately repeated by a stutter or a chunk boundary

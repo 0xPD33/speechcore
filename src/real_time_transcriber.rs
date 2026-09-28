@@ -9,14 +9,14 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 // Use local modules
 use crate::audio_capture::AudioCapture;
 use crate::audio_processor::AudioProcessor;
-use crate::backend::{create_backend, BackendType, TranscriptionBackend};
+use crate::backend::TranscriptionBackend;
 use crate::backend_manager::{BackendCommand, BackendManager};
 use crate::config::SpeechConfig;
 use crate::feedback::{FeedbackEvent, FeedbackSink};
 use crate::silero_audio_processor::{AudioSegment, SileroVad};
 use crate::state::{AudioVisualizationData, BackendStatus, BackendStatusState, ProcessingState};
 use crate::stats_reporter::StatsReporter;
-use crate::transcription_processor::TranscriptionProcessor;
+use crate::transcription_processor::{SessionLedger, TranscriptionProcessor};
 use crate::transcription_stats::TranscriptionStats;
 
 /// Transcription mode enumeration
@@ -163,6 +163,10 @@ pub enum ManualSessionCommand {
     CancelSession {
         responder: Option<oneshot::Sender<anyhow::Result<()>>>,
     },
+    /// Start or stop a manual session, or pause or resume realtime capture.
+    /// The transcriber decides from its own session state, so a press during
+    /// the drain after Stop starts a new session instead of stopping again.
+    Toggle,
     SwitchMode(TranscriptionMode),
 }
 
@@ -204,7 +208,7 @@ pub struct RealTimeTranscriber {
     // Model and parameters
     backend: Arc<Mutex<Option<Arc<TranscriptionBackend>>>>,
     backend_ready: Arc<AtomicBool>,
-    language: String,
+    language: Arc<RwLock<String>>,
     app_config: Arc<SpeechConfig>,
 
     // Processing components
@@ -230,7 +234,6 @@ pub struct RealTimeTranscriber {
     transcription_handle: Option<tokio::task::JoinHandle<()>>,
     streaming_handle: Option<tokio::task::JoinHandle<()>>,
     audio_handle: Option<tokio::task::JoinHandle<()>>,
-    backend_load_handle: Option<tokio::task::JoinHandle<()>>,
     backend_manager_handle: Option<tokio::task::JoinHandle<()>>,
     manual_session_handle: Option<tokio::task::JoinHandle<()>>,
     recording_monitor_handle: Option<tokio::task::JoinHandle<()>>,
@@ -243,6 +246,8 @@ pub struct RealTimeTranscriber {
     current_manual_session: Arc<Mutex<Option<ManualSession>>>,
     processing_manual_session: Arc<Mutex<Option<ManualProcessingSession>>>,
     finalizing_manual_session: Arc<AtomicBool>,
+    /// Stopped sessions awaiting their transcript, and cancelled ones.
+    session_ledger: Arc<Mutex<SessionLedger>>,
     manual_session_tx: mpsc::Sender<ManualSessionCommand>,
     manual_session_rx: Option<mpsc::Receiver<ManualSessionCommand>>,
 
@@ -269,14 +274,16 @@ impl RealTimeTranscriber {
     /// Creates a new RealTimeTranscriber instance
     ///
     /// # Arguments
-    /// * `model_path` - Path to the transcription model file or directory
+    /// * `model_path` - Path to the transcription model file or directory. With
+    ///   `None`, the model named in the config is resolved in the background and
+    ///   its download progress shows in `backend_status`.
     /// * `app_config` - Application configuration
     /// * `feedback_sink` - Optional app-owned feedback hook
     ///
     /// # Returns
     /// Result containing the new instance or an error
     pub fn new(
-        model_path: PathBuf,
+        model_path: Option<PathBuf>,
         app_config: SpeechConfig,
         feedback_sink: Option<Arc<dyn FeedbackSink>>,
     ) -> Result<Self, anyhow::Error> {
@@ -300,7 +307,6 @@ impl RealTimeTranscriber {
         }
 
         tracing::info!("Using Silero VAD model at: {:?}", silero_model_path);
-        tracing::info!("Using transcription model at: {:?}", model_path);
 
         let running = Arc::new(AtomicBool::new(true));
         let recording = Arc::new(AtomicBool::new(false));
@@ -333,96 +339,38 @@ impl RealTimeTranscriber {
             }
         };
 
-        let backend_clone = backend.clone();
         let backend_ready = Arc::new(AtomicBool::new(false));
-        let backend_ready_for_task = backend_ready.clone();
-        let model_path_clone = model_path.clone();
         let backend_type = app_config.backend_config.backend;
-        let backend_config = app_config.backend_config.clone();
 
         // Create backend status (shared with UI status bar)
-        let backend_name = match backend_type {
-            BackendType::CTranslate2 => "CTranslate2",
-            BackendType::WhisperCpp => "WhisperCpp",
-            BackendType::Moonshine => "Moonshine",
-            BackendType::Parakeet => "Parakeet",
-            BackendType::Nemotron => "Nemotron",
-        };
         let backend_status = Arc::new(RwLock::new(BackendStatus::new(
-            backend_name.to_string(),
+            crate::backend_manager::backend_display_name(backend_type).to_string(),
             app_config.general_config.model.clone(),
         )));
+        backend_status.write().state = BackendStatusState::Loading("Initializing...".to_string());
 
-        // Create backend manager
+        // The startup load goes through the manager's queue like any reload.
         let mut backend_manager = BackendManager::new(
             backend.clone(),
             backend_ready.clone(),
             backend_status.clone(),
+            audio_visualization_data.clone(),
         );
         let backend_manager_handle = backend_manager.start();
         let backend_command_tx = backend_manager.command_sender();
-
-        // Set initial processing state for loading
-        {
-            let mut audio_data = audio_visualization_data.write();
-            audio_data.set_processing_state(ProcessingState::Loading);
-        }
-        {
-            let mut s = backend_status.write();
-            s.state = BackendStatusState::Loading("Initializing...".to_string());
-        }
-
-        let backend_status_for_load = backend_status.clone();
-        let audio_visualization_data_for_load = audio_visualization_data.clone();
-        let backend_load_handle = tokio::spawn(async move {
-            tracing::info!(
-                "INFO: Loading {} backend with model at {:?}",
-                backend_type,
-                model_path_clone
-            );
-            tracing::info!(
-                "Backend config: threads={}, gpu_enabled={}, quantization={:?}",
-                backend_config.threads,
-                backend_config.gpu_enabled,
-                backend_config.quantization_level
-            );
-
-            match create_backend(backend_type, &model_path_clone, &backend_config).await {
-                Ok(b) => {
-                    tracing::info!("{} backend loaded successfully!", backend_type);
-                    let capabilities = b.capabilities();
-                    tracing::info!(
-                        "Backend capabilities: name={}, max_audio_duration={:?}, streaming={}",
-                        capabilities.name,
-                        capabilities.max_audio_duration,
-                        capabilities.supports_streaming
-                    );
-                    *backend_clone.lock() = Some(Arc::new(b));
-                    backend_ready_for_task.store(true, Ordering::Relaxed);
-                    tracing::info!("Backend ready for transcription");
-
-                    // Set processing state to idle after successful load
-                    let mut audio_data = audio_visualization_data_for_load.write();
-                    audio_data.set_processing_state(ProcessingState::Idle);
-
-                    // Update backend status to ready
-                    let mut s = backend_status_for_load.write();
-                    s.state = BackendStatusState::Ready;
-                }
-                Err(e) => {
-                    tracing::warn!("ERROR: Failed to load backend: {}", e);
-                    tracing::warn!("Backend will not be available for transcription");
-
-                    // Set processing state to error on load failure
-                    let mut audio_data = audio_visualization_data_for_load.write();
-                    audio_data.set_processing_state(ProcessingState::Error);
-
-                    // Update backend status to error
-                    let mut s = backend_status_for_load.write();
-                    s.state = BackendStatusState::Error(format!("{}", e));
-                    s.error_time = Some(std::time::Instant::now());
-                }
-            }
+        audio_visualization_data
+            .write()
+            .set_processing_state(ProcessingState::Loading);
+        let backend_config = app_config.backend_config.clone();
+        let _ = backend_command_tx.send(match model_path {
+            Some(model_path) => BackendCommand::Load {
+                backend_config,
+                model_path,
+            },
+            None => BackendCommand::Reload {
+                backend_config,
+                model_name: app_config.general_config.model.clone(),
+            },
         });
 
         // Initialize transcription mode from config
@@ -435,9 +383,10 @@ impl RealTimeTranscriber {
         let app_config = Arc::new(app_config);
 
         Ok(Self {
-            audio_capture: Arc::new(Mutex::new(AudioCapture::with_buffer_size(
-                audio_buffer_size,
-            ))),
+            audio_capture: Arc::new(Mutex::new(
+                AudioCapture::with_buffer_size(audio_buffer_size)
+                    .with_input_device(app_config.audio_processor_config.input_device.clone()),
+            )),
             tx,
             rx: Some(rx),
             transcript_tx,
@@ -446,7 +395,7 @@ impl RealTimeTranscriber {
             recording,
             backend,
             backend_ready,
-            language: app_config.general_config.language.clone(),
+            language: Arc::new(RwLock::new(app_config.general_config.language.clone())),
             app_config,
             audio_processor,
             transcript_history,
@@ -462,7 +411,6 @@ impl RealTimeTranscriber {
             transcription_handle: None,
             streaming_handle: None,
             audio_handle: None,
-            backend_load_handle: Some(backend_load_handle),
             backend_manager_handle: Some(backend_manager_handle),
             manual_session_handle: None,
             recording_monitor_handle: None,
@@ -473,6 +421,7 @@ impl RealTimeTranscriber {
             current_manual_session,
             processing_manual_session,
             finalizing_manual_session: Arc::new(AtomicBool::new(false)),
+            session_ledger: Arc::new(Mutex::new(SessionLedger::default())),
             manual_session_tx,
             manual_session_rx: Some(manual_session_rx),
 
@@ -525,6 +474,8 @@ impl RealTimeTranscriber {
             self.transcription_done_tx.clone(),
             self.transcription_stats.clone(),
             self.audio_visualization_data.clone(),
+            self.backend_status.clone(),
+            self.session_ledger.clone(),
         );
 
         // Initialize audio processor
@@ -589,17 +540,42 @@ impl RealTimeTranscriber {
         let transcription_stats = self.transcription_stats.clone(); // For drain detection
         let manual_mode_config = self.app_config.manual_mode_config.clone();
         let sample_rate = crate::config::SAMPLE_RATE;
+        let backend_status = self.backend_status.clone();
+        let session_ledger = self.session_ledger.clone();
 
         self.manual_session_handle = Some(tokio::spawn(async move {
             while running.load(Ordering::Relaxed) {
                 tokio::select! {
                     command = manual_session_rx.recv() => {
                         if let Some(cmd) = command {
+                            let cmd = match cmd {
+                                ManualSessionCommand::Toggle => {
+                                    let mode = TranscriptionMode::from_u8(transcription_mode.load(Ordering::Relaxed));
+                                    if mode == TranscriptionMode::RealTime {
+                                        Self::toggle_capture(&audio_capture, &recording, feedback_sink.as_deref(), &backend_status);
+                                        continue;
+                                    }
+                                    if current_manual_session.lock().is_some() {
+                                        ManualSessionCommand::StopSession { responder: None }
+                                    } else {
+                                        ManualSessionCommand::StartSession { responder: None }
+                                    }
+                                }
+                                cmd => cmd,
+                            };
                             match cmd {
                                 ManualSessionCommand::StartSession { mut responder } => {
                                     let current_mode = TranscriptionMode::from_u8(transcription_mode.load(Ordering::Relaxed));
                                     if current_mode == TranscriptionMode::Manual {
-                                        // Check if a session is currently finalizing
+                                        // A new session clears the audio buffer, so wait until the
+                                        // previous session has taken its audio. The drain gives up
+                                        // after 2 s, so 3 s only trips on a stuck drain.
+                                        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+                                        while finalizing_manual_session.load(Ordering::Relaxed)
+                                            && tokio::time::Instant::now() < deadline
+                                        {
+                                            tokio::time::sleep(Duration::from_millis(10)).await;
+                                        }
                                         if finalizing_manual_session.load(Ordering::Relaxed) {
                                             tracing::warn!("Cannot start new session: previous session is still finalizing");
                                             if let Some(responder) = responder.take() {
@@ -653,6 +629,20 @@ impl RealTimeTranscriber {
                                             continue;
                                         }
 
+                                        // Open the mic before touching the buffer or transcript,
+                                        // so a failure leaves both alone.
+                                        let mic_started = audio_capture.lock().start_recording();
+                                        if let Err(e) = mic_started {
+                                            tracing::warn!("Failed to start audio recording: {}", e);
+                                            let _ = audio_capture.lock().stop_recording();
+                                            *current_manual_session.lock() = None;
+                                            backend_status.write().report_error(format!("Microphone failed: {e}"));
+                                            if let Some(responder) = responder.take() {
+                                                let _ = responder.send(Err(e));
+                                            }
+                                            continue;
+                                        }
+
                                         // Atomically clear buffer and set session ID under both locks
                                         if let Some(ref audio_processor) = audio_processor_ref {
                                             audio_processor.start_new_manual_session(session_id.clone());
@@ -669,12 +659,7 @@ impl RealTimeTranscriber {
                                             audio_data.reset_requested = true;
                                         }
 
-                                        // Start the audio capture stream FIRST
-                                        if let Err(e) = audio_capture.lock().start_recording() {
-                                            tracing::warn!("Warning: Failed to start audio recording: {}", e);
-                                        }
-
-                                        // Then set recording flag (prevents dropping initial audio)
+                                        // Set the flag only after the stream runs (prevents dropping initial audio)
                                         recording.store(true, Ordering::Relaxed);
 
                                         // Play session start sound
@@ -705,6 +690,7 @@ impl RealTimeTranscriber {
 
                                         let session_id_opt = match session_id_opt {
                                             Some(session_id) => {
+                                                session_ledger.lock().stopped(session_id.clone());
                                                 // Stop the audio stream FIRST (no more audio captured)
                                                 if let Err(e) = audio_capture.lock().stop_recording() {
                                                     tracing::warn!("Warning: Failed to stop audio recording: {}", e);
@@ -750,10 +736,11 @@ impl RealTimeTranscriber {
                                                 let recording_for_task = recording.clone();
                                                 let audio_capture_for_drain = audio_capture.clone();
                                                 let transcription_stats_for_drain = transcription_stats.clone();
-                                                let finalizing_flag = finalizing_manual_session.clone();
+                                                // Raised before the spawn, so a Start queued right behind
+                                                // this Stop already waits for the drain.
+                                                let finalizing_guard =
+                                                    FinalizingGuard::new(finalizing_manual_session.clone());
                                                 tokio::spawn(async move {
-                                                    // Guard lives for the entire async task duration
-                                                    let _guard = FinalizingGuard::new(finalizing_flag);
 
                                                     // Wait for channel to drain using sample counters
                                                     let sent_count = audio_capture_for_drain.lock().get_samples_sent_count();
@@ -790,10 +777,6 @@ impl RealTimeTranscriber {
                                                     // NOW set recording=false after channel has drained
                                                     recording_for_task.store(false, Ordering::Relaxed);
 
-                                                    // Drop the guard immediately after drain completes so new
-                                                    // sessions can start while transcription is still running
-                                                    drop(_guard);
-
                                                     // Set processing state to transcribing for manual session
                                                     {
                                                         let mut audio_data = audio_viz_data.write();
@@ -803,6 +786,10 @@ impl RealTimeTranscriber {
                                                     let transcription_result = audio_processor
                                                         .trigger_manual_transcription(sample_rate, Some(captured_session_id.clone()))
                                                         .await;
+
+                                                    // The audio is taken now, so a new session may clear the
+                                                    // buffer while this one is still being transcribed.
+                                                    drop(finalizing_guard);
 
                                                     if let Err(e) = transcription_result {
                                                         tracing::warn!(
@@ -876,23 +863,21 @@ impl RealTimeTranscriber {
                                 ManualSessionCommand::CancelSession { mut responder } => {
                                     let current_mode = TranscriptionMode::from_u8(transcription_mode.load(Ordering::Relaxed));
                                     if current_mode == TranscriptionMode::Manual {
-                                        let mut cancelled = false;
+                                        // Cancel the newest session only: the recording one, or
+                                        // else the last one stopped whose transcript is not out.
+                                        let recording_id = current_manual_session
+                                            .lock()
+                                            .take()
+                                            .map(|session| session.session_id);
+                                        let cancelled = session_ledger.lock().cancel(recording_id);
 
-                                        {
-                                            let mut session_lock = current_manual_session.lock();
-                                            if let Some(_session) = session_lock.take() {
-                                                cancelled = true;
-                                            }
-                                        }
+                                        if let Some(session_id) = cancelled {
+                                            Self::clear_processing_session_if_matches(
+                                                &processing_manual_session,
+                                                &session_id,
+                                            );
 
-                                        {
-                                            let mut processing_lock = processing_manual_session.lock();
-                                            if let Some(_processing) = processing_lock.take() {
-                                                cancelled = true;
-                                            }
-                                        }
 
-                                        if cancelled {
                                             // Stop stream first, then clear flag
                                             if let Err(e) = audio_capture.lock().stop_recording() {
                                                 tracing::warn!("Warning: Failed to stop audio recording: {}", e);
@@ -1011,15 +996,14 @@ impl RealTimeTranscriber {
                                                 tracing::warn!("Warning: Failed to stop audio recording during mode switch: {}", e);
                                             }
 
-                                            // Now start recording in RealTime mode - stream first, then flag
-                                            if let Err(e) = audio_capture.lock().start_recording() {
-                                                tracing::warn!("Warning: Failed to start audio recording for RealTime mode: {}", e);
-                                            }
-                                            recording.store(true, Ordering::Relaxed);
+                                            Self::start_realtime_capture(&audio_capture, &recording, &backend_status);
                                         }
                                         // Same mode - no action needed
                                         _ => {}
                                     }
+                                }
+                                ManualSessionCommand::Toggle => {
+                                    unreachable!("Toggle is converted to Start or Stop above")
                                 }
                             }
                         } else {
@@ -1210,10 +1194,6 @@ impl RealTimeTranscriber {
             Self::wait_for_task(handle, "Transcription processor", shutdown_timeout).await;
         }
 
-        if let Some(handle) = self.backend_load_handle.take() {
-            Self::wait_for_task(handle, "Backend load", shutdown_timeout).await;
-        }
-
         if let Some(handle) = self.backend_manager_handle.take() {
             Self::wait_for_task(handle, "Backend manager", shutdown_timeout).await;
         }
@@ -1225,40 +1205,60 @@ impl RealTimeTranscriber {
         Ok(())
     }
 
-    /// Toggles the recording state between active and paused
-    /// This method is completely non-blocking - audio threads detect the change asynchronously
+    /// Toggles realtime capture between active and paused.
     pub fn toggle_recording(&mut self) {
-        let was_recording = self.recording.load(Ordering::Relaxed);
-        let new_state = !was_recording;
+        Self::toggle_capture(
+            &self.audio_capture,
+            &self.recording,
+            self.feedback_sink.as_deref(),
+            &self.backend_status,
+        );
+    }
 
-        // Control audio stream with correct ordering to prevent dropping audio
+    fn toggle_capture(
+        audio_capture: &Mutex<AudioCapture>,
+        recording: &AtomicBool,
+        feedback_sink: Option<&dyn FeedbackSink>,
+        backend_status: &RwLock<BackendStatus>,
+    ) {
+        let was_recording = recording.load(Ordering::Relaxed);
+
+        // Stream and flag change in this order so no audio is dropped.
         if was_recording {
-            // Stopping: stop stream first, then clear flag
-            if let Err(e) = self.audio_capture.lock().stop_recording() {
+            if let Err(e) = audio_capture.lock().stop_recording() {
                 tracing::warn!("Warning: Failed to stop audio recording: {}", e);
             }
-            self.recording.store(false, Ordering::Relaxed);
+            recording.store(false, Ordering::Relaxed);
         } else {
-            // Starting: start stream first, then set flag
-            if let Err(e) = self.audio_capture.lock().start_recording() {
-                tracing::warn!("Warning: Failed to start audio recording: {}", e);
-            }
-            self.recording.store(true, Ordering::Relaxed);
+            Self::start_realtime_capture(audio_capture, recording, backend_status);
         }
 
-        tracing::info!("Recording toggled: {} -> {}", was_recording, new_state);
+        tracing::info!("Recording toggled: {} -> {}", was_recording, !was_recording);
 
-        // Notify the optional app-owned feedback sink.
-        if let Some(feedback_sink) = &self.feedback_sink {
-            if new_state {
-                feedback_sink.play(FeedbackEvent::RecordStart);
+        if let Some(feedback_sink) = feedback_sink {
+            feedback_sink.play(if was_recording {
+                FeedbackEvent::RecordStop
             } else {
-                feedback_sink.play(FeedbackEvent::RecordStop);
-            }
+                FeedbackEvent::RecordStart
+            });
         }
+    }
 
-        // All transcription processing will detect the atomic state change via polling
-        // UI remains responsive while audio/transcription systems adapt asynchronously
+    /// Starts the stream, then raises the flag. The flag stays up on failure,
+    /// so stall recovery keeps trying to reopen the device.
+    fn start_realtime_capture(
+        audio_capture: &Mutex<AudioCapture>,
+        recording: &AtomicBool,
+        backend_status: &RwLock<BackendStatus>,
+    ) {
+        let started = audio_capture.lock().start_recording();
+        if let Err(e) = started {
+            tracing::warn!("Failed to start audio recording: {}", e);
+            backend_status
+                .write()
+                .report_error(format!("Microphone failed: {e}"));
+        }
+        recording.store(true, Ordering::Relaxed);
     }
 
     /// Returns the current transcript history
@@ -1315,6 +1315,11 @@ impl RealTimeTranscriber {
     /// Get the transcript receiver for listening to new transcriptions
     pub fn get_transcript_rx(&self) -> broadcast::Receiver<TranscriptionMessage> {
         self.transcript_tx.subscribe()
+    }
+
+    /// Shared transcription language. A write applies from the next recording on.
+    pub fn get_language(&self) -> Arc<RwLock<String>> {
+        self.language.clone()
     }
 
     /// Get the current transcription mode

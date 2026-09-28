@@ -296,6 +296,16 @@ fn convert_model(model_name: &str, output_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A stalled connection fails after 30 s without data instead of hanging forever.
+/// No total timeout: large models take minutes on slow links.
+fn download_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .read_timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("Failed to build HTTP client")
+}
+
 /// Download a file from a URL and save it to the specified path
 pub async fn download_file(url: &str, output_path: &Path) -> Result<()> {
     download_file_with_progress(url, output_path, None).await
@@ -320,7 +330,9 @@ pub async fn download_file_with_progress(
     let temp_path = output_path.with_extension("downloading");
 
     // Perform the download
-    let response = reqwest::get(url)
+    let response = download_client()?
+        .get(url)
+        .send()
         .await
         .context(format!("Failed to download file from {}", url))?;
 
@@ -384,7 +396,9 @@ pub async fn download_file_optional_with_progress(
         }
     }
 
-    let response = reqwest::get(url)
+    let response = download_client()?
+        .get(url)
+        .send()
         .await
         .context(format!("Failed to download file from {}", url))?;
 

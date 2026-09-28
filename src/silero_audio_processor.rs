@@ -28,6 +28,9 @@ pub struct AudioSegment {
     /// Explicit flag indicating if this is a manual transcription segment
     /// Replaces duration-based heuristic (>5s) for better accuracy
     pub is_manual: bool,
+    /// Manual only: sent while recording, so more audio of the session follows.
+    /// The segment without this flag ends the session.
+    pub partial: bool,
 }
 
 /// Configuration for Voice Activity Detection
@@ -329,6 +332,7 @@ impl SileroVad {
                     sample_rate: self.config.sample_rate,
                     session_id: None, // Will be set by AudioProcessor
                     is_manual: false, // VAD-generated segments are always realtime
+                    partial: false,
                 };
 
                 if !segment.samples.is_empty() {
@@ -458,6 +462,7 @@ impl SileroVad {
                 sample_rate: self.config.sample_rate,
                 session_id: None, // Will be set by AudioProcessor
                 is_manual: false, // VAD-generated segments are always realtime
+                partial: false,
             };
 
             if !segment.samples.is_empty() {
@@ -638,6 +643,7 @@ impl SileroVad {
                 sample_rate: self.config.sample_rate,
                 session_id: None, // Will be set by AudioProcessor
                 is_manual: false, // VAD-generated segments are always realtime
+                partial: false,
             })
         } else {
             None

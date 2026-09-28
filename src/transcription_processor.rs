@@ -1,4 +1,34 @@
 use parking_lot::{Mutex, RwLock};
+use std::collections::HashSet;
+
+/// Manual sessions between Stop and their transcript, and the ones the user cancelled.
+#[derive(Debug, Default)]
+pub struct SessionLedger {
+    /// Stopped sessions whose transcript is not out yet, oldest first.
+    awaiting: Vec<String>,
+    // ponytail: a session cancelled while recording never finishes, so its id
+    // stays here; one short string per cancel.
+    cancelled: HashSet<String>,
+}
+
+impl SessionLedger {
+    pub(crate) fn stopped(&mut self, session_id: String) {
+        self.awaiting.push(session_id);
+    }
+
+    /// Cancels the recording session, or else the newest one still being transcribed.
+    pub(crate) fn cancel(&mut self, recording: Option<String>) -> Option<String> {
+        let session_id = recording.or_else(|| self.awaiting.pop())?;
+        self.cancelled.insert(session_id.clone());
+        Some(session_id)
+    }
+
+    /// Marks a session's transcript as out. Returns whether it was cancelled.
+    fn finish(&mut self, session_id: &str) -> bool {
+        self.awaiting.retain(|id| id != session_id);
+        self.cancelled.remove(session_id)
+    }
+}
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -14,7 +44,7 @@ use crate::config::SpeechConfig;
 ))]
 use crate::post_processor;
 use crate::silero_audio_processor::{AudioSegment, SileroVad, VadConfig, VadState};
-use crate::state::{AudioVisualizationData, ProcessingState};
+use crate::state::{AudioVisualizationData, BackendStatus, BackendStatusState, ProcessingState};
 use crate::transcription_stats::TranscriptionStats;
 
 /// Extract the last N words from text for use as a prompt
@@ -144,12 +174,14 @@ fn find_pause_points(samples: &[f32], sample_rate: usize) -> Vec<usize> {
 pub struct TranscriptionProcessor {
     backend: Arc<Mutex<Option<Arc<TranscriptionBackend>>>>,
     backend_ready: Arc<AtomicBool>,
-    language: String,
+    language: Arc<RwLock<String>>,
     app_config: Arc<SpeechConfig>,
     running: Arc<AtomicBool>,
     transcription_done_tx: mpsc::UnboundedSender<()>,
     transcription_stats: Arc<Mutex<TranscriptionStats>>,
     audio_visualization_data: Arc<RwLock<AudioVisualizationData>>,
+    backend_status: Arc<RwLock<BackendStatus>>,
+    session_ledger: Arc<Mutex<SessionLedger>>,
 }
 
 impl TranscriptionProcessor {
@@ -157,12 +189,14 @@ impl TranscriptionProcessor {
     pub fn new(
         backend: Arc<Mutex<Option<Arc<TranscriptionBackend>>>>,
         backend_ready: Arc<AtomicBool>,
-        language: String,
+        language: Arc<RwLock<String>>,
         app_config: Arc<SpeechConfig>,
         running: Arc<AtomicBool>,
         transcription_done_tx: mpsc::UnboundedSender<()>,
         transcription_stats: Arc<Mutex<TranscriptionStats>>,
         audio_visualization_data: Arc<RwLock<AudioVisualizationData>>,
+        backend_status: Arc<RwLock<BackendStatus>>,
+        session_ledger: Arc<Mutex<SessionLedger>>,
     ) -> Self {
         Self {
             backend,
@@ -173,11 +207,15 @@ impl TranscriptionProcessor {
             transcription_done_tx,
             transcription_stats,
             audio_visualization_data,
+            backend_status,
+            session_ledger,
         }
     }
 
     /// Transcribe an audio segment using the backend.
     /// Optionally accepts an initial prompt for chunk continuity (whisper.cpp only; CT2 ignores it).
+    /// Returns `None` on failure, after reporting the error to `backend_status`.
+    #[allow(clippy::too_many_arguments)]
     fn transcribe_segment(
         backend: &Arc<Mutex<Option<Arc<TranscriptionBackend>>>>,
         segment: &AudioSegment,
@@ -185,8 +223,9 @@ impl TranscriptionProcessor {
         app_config: &SpeechConfig,
         stats: &Arc<Mutex<TranscriptionStats>>,
         audio_visualization_data: &Arc<RwLock<AudioVisualizationData>>,
+        backend_status: &RwLock<BackendStatus>,
         initial_prompt: Option<&str>,
-    ) -> String {
+    ) -> Option<String> {
         let log_stats_enabled = app_config.debug_config.log_stats_enabled;
 
         // Set processing state to transcribing
@@ -227,7 +266,10 @@ impl TranscriptionProcessor {
                 let mut audio_data = audio_visualization_data.write();
                 audio_data.set_processing_state(ProcessingState::Idle);
             }
-            return "[backend not available]".to_string();
+            backend_status
+                .write()
+                .report_error("No model loaded; recording not transcribed");
+            return None;
         };
 
         #[cfg(all(
@@ -238,12 +280,15 @@ impl TranscriptionProcessor {
         ))]
         {
             let _ = backend_ref;
-            let _ = (language, stats);
+            let _ = (language, stats, initial_prompt);
             {
                 let mut audio_data = audio_visualization_data.write();
                 audio_data.set_processing_state(ProcessingState::Error);
             }
-            "[no transcription backend feature enabled]".to_string()
+            backend_status
+                .write()
+                .report_error("No transcription backend feature enabled");
+            None
         }
 
         #[cfg(any(
@@ -257,7 +302,13 @@ impl TranscriptionProcessor {
             let whisper_cpp_options = {
                 let mut options = app_config.whisper_cpp_options.clone();
                 if let Some(prompt) = initial_prompt.filter(|prompt| !prompt.is_empty()) {
-                    options.initial_prompt = Some(prompt.to_string());
+                    // Keep the configured vocabulary ahead of the chunk context.
+                    options.initial_prompt = Some(
+                        match options.initial_prompt.as_deref().filter(|v| !v.is_empty()) {
+                            Some(vocabulary) => format!("{vocabulary} {prompt}"),
+                            None => prompt.to_string(),
+                        },
+                    );
                 }
                 options
             };
@@ -349,22 +400,22 @@ impl TranscriptionProcessor {
                         audio_data.set_processing_state(ProcessingState::Idle);
                     }
 
-                    processed_transcription
+                    Some(processed_transcription)
                 }
                 Err(e) => {
-                    let total_duration = start_time.elapsed();
-                    if log_stats_enabled {
-                        tracing::info!(
-                            "Transcription error after {:.2}s: {}",
-                            total_duration.as_secs_f32(),
-                            e
-                        );
-                    }
+                    tracing::warn!(
+                        "Transcription error after {:.2}s: {}",
+                        start_time.elapsed().as_secs_f32(),
+                        e
+                    );
                     {
                         let mut audio_data = audio_visualization_data.write();
                         audio_data.set_processing_state(ProcessingState::Error);
                     }
-                    format!("[transcription error: {}]", e)
+                    backend_status
+                        .write()
+                        .report_error(format!("Transcription failed: {e}"));
+                    None
                 }
             }
         }
@@ -378,6 +429,9 @@ impl TranscriptionProcessor {
         app_config: Arc<SpeechConfig>,
         stats: Arc<Mutex<TranscriptionStats>>,
         audio_visualization_data: Arc<RwLock<AudioVisualizationData>>,
+        backend_status: Arc<RwLock<BackendStatus>>,
+        session_ledger: Arc<Mutex<SessionLedger>>,
+        manual_assembly: Arc<Mutex<Option<ManualAssembly>>>,
         transcript_tx: broadcast::Sender<crate::real_time_transcriber::TranscriptionMessage>,
         log_stats_enabled: bool,
     ) {
@@ -386,61 +440,59 @@ impl TranscriptionProcessor {
             segment.start_time, segment.end_time
         );
         let start_time = Instant::now();
+        let session_id = segment.session_id.clone();
+        let partial = segment.partial;
+        let ends_manual_session = segment.is_manual && !segment.partial;
 
         let processing_result = tokio::task::spawn_blocking(move || {
-            let session_id = segment.session_id.clone();
-
             if segment.is_manual {
-                let transcription = Self::process_manual_segment(
+                Self::process_manual_part(
+                    &manual_assembly,
+                    segment,
                     &backend,
-                    &segment,
                     &language,
                     &app_config,
                     &stats,
                     &audio_visualization_data,
-                );
-
-                if transcription.is_empty() {
-                    tracing::info!("Manual transcription resulted in empty text");
-                    None
-                } else {
-                    Some(crate::real_time_transcriber::TranscriptionMessage {
-                        text: transcription,
-                        session_id,
-                        is_final: true,
-                    })
-                }
+                    &backend_status,
+                )
             } else {
-                let transcription = Self::transcribe_segment(
+                Self::transcribe_segment(
                     &backend,
                     &segment,
                     &language,
                     &app_config,
                     &stats,
                     &audio_visualization_data,
+                    &backend_status,
                     None,
-                );
-
-                if transcription.is_empty() {
-                    None
-                } else {
-                    Some(crate::real_time_transcriber::TranscriptionMessage {
-                        text: transcription,
-                        session_id,
-                        is_final: true,
-                    })
-                }
+                )
             }
         })
         .await;
 
+        // Checked after transcribing: Cancel may arrive while the backend runs.
+        let cancelled = ends_manual_session
+            && session_id
+                .as_deref()
+                .is_some_and(|id| session_ledger.lock().finish(id));
+
         match processing_result {
-            Ok(Some(message)) => {
-                if let Err(e) = transcript_tx.send(message) {
+            Ok(Some(text)) if !text.is_empty() => {
+                if cancelled {
+                    tracing::info!("Dropping transcript of cancelled session {:?}", session_id);
+                } else if let Err(e) =
+                    transcript_tx.send(crate::real_time_transcriber::TranscriptionMessage {
+                        text,
+                        session_id,
+                        is_final: true,
+                    })
+                {
                     tracing::warn!("Failed to send transcription: {}", e);
                 }
             }
-            Ok(None) => {}
+            Ok(_) if !partial => tracing::info!("Transcription produced no text"),
+            Ok(_) => {}
             Err(e) => tracing::warn!("Transcription worker task failed: {}", e),
         }
 
@@ -496,7 +548,7 @@ impl TranscriptionProcessor {
                         session_id = sid;
                         active = b.supports_streaming();
                         if active {
-                            let lang = language.clone();
+                            let lang = language.read().clone();
                             let opts = app_config.nemotron_options.clone();
                             let _ =
                                 tokio::task::spawn_blocking(move || b.stream_reset(&lang, &opts))
@@ -555,6 +607,9 @@ impl TranscriptionProcessor {
         let transcription_done_tx = self.transcription_done_tx.clone();
         let transcription_stats = self.transcription_stats.clone();
         let audio_visualization_data = self.audio_visualization_data.clone();
+        let backend_status = self.backend_status.clone();
+        let session_ledger = self.session_ledger.clone();
+        let manual_assembly = Arc::new(Mutex::new(None));
 
         let log_stats_enabled = app_config.debug_config.log_stats_enabled;
 
@@ -562,81 +617,59 @@ impl TranscriptionProcessor {
         tokio::spawn(async move {
             tracing::info!("Transcription task started");
 
-            // Wait for backend to be ready before processing segments
-            tracing::info!("Waiting for transcription backend to initialize...");
-            let warn_interval = std::time::Duration::from_secs(10);
-            let mut last_warn = std::time::Instant::now();
-
-            while !backend_ready.load(Ordering::Relaxed) {
-                if !running.load(Ordering::Relaxed) {
-                    tracing::info!(
-                        "Transcription task shutting down before backend initialization"
-                    );
-                    return;
-                }
-
-                if last_warn.elapsed() >= warn_interval {
-                    tracing::warn!(
-                        "Backend is still initializing (>{}s); continuing to wait",
-                        warn_interval.as_secs()
-                    );
-                    last_warn = std::time::Instant::now();
-                }
-
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-
-            tracing::info!("Backend ready, starting transcription processing");
-
             // When recording is false, no segments are received from AudioProcessor,
             // so this task naturally idles until recording is resumed
             loop {
-                // Check if we should shut down
-                if !running.load(Ordering::Relaxed) {
-                    // Before shutting down, process any remaining segments
-                    while let Ok(segment) = segment_rx.try_recv() {
-                        Self::process_segment(
-                            segment,
-                            backend.clone(),
-                            language.clone(),
-                            app_config.clone(),
-                            transcription_stats.clone(),
-                            audio_visualization_data.clone(),
-                            transcript_tx.clone(),
-                            log_stats_enabled,
-                        )
-                        .await;
+                let segment = if running.load(Ordering::Relaxed) {
+                    // Wakes up to notice shutdown; the senders outlive this task.
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(100),
+                        segment_rx.recv(),
+                    )
+                    .await
+                    {
+                        Ok(Some(segment)) => segment,
+                        Ok(None) => break,
+                        Err(_) => continue,
                     }
-                    break;
+                } else {
+                    // Before shutting down, process any remaining segments
+                    match segment_rx.try_recv() {
+                        Ok(segment) => segment,
+                        Err(_) => break,
+                    }
+                };
+
+                // Wait out a (re)load, but drop the segment when no model will come,
+                // so a failed load cannot back up the audio pipeline.
+                while !backend_ready.load(Ordering::Relaxed)
+                    && running.load(Ordering::Relaxed)
+                    && backend_status.read().state != BackendStatusState::NoModel
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                if !backend_ready.load(Ordering::Relaxed) {
+                    backend_status
+                        .write()
+                        .report_error("No model loaded; recording not transcribed");
+                    continue;
                 }
 
-                // Block on receiving segments without timeout - this is much more efficient
-                match segment_rx.recv().await {
-                    Some(segment) => {
-                        // Wait for backend to be ready (e.g. during model reload)
-                        while !backend_ready.load(Ordering::Relaxed) {
-                            if !running.load(Ordering::Relaxed) {
-                                break;
-                            }
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        }
-                        Self::process_segment(
-                            segment,
-                            backend.clone(),
-                            language.clone(),
-                            app_config.clone(),
-                            transcription_stats.clone(),
-                            audio_visualization_data.clone(),
-                            transcript_tx.clone(),
-                            log_stats_enabled,
-                        )
-                        .await;
-                    }
-                    None => {
-                        // Channel closed
-                        break;
-                    }
-                }
+                let segment_language = language.read().clone();
+                Self::process_segment(
+                    segment,
+                    backend.clone(),
+                    segment_language,
+                    app_config.clone(),
+                    transcription_stats.clone(),
+                    audio_visualization_data.clone(),
+                    backend_status.clone(),
+                    session_ledger.clone(),
+                    manual_assembly.clone(),
+                    transcript_tx.clone(),
+                    log_stats_enabled,
+                )
+                .await;
             }
 
             tracing::info!("Transcription task shutting down");
@@ -644,282 +677,133 @@ impl TranscriptionProcessor {
         })
     }
 
-    /// Process a manual mode segment with specialized handling for longer audio
-    fn process_manual_segment(
+    /// Adds a manual segment to its session's assembly. Parts sent while recording
+    /// are transcribed chunk by chunk as they fill up; the final segment
+    /// transcribes the rest and returns the text of the whole session.
+    #[allow(clippy::too_many_arguments)]
+    fn process_manual_part(
+        assembly: &Mutex<Option<ManualAssembly>>,
+        segment: AudioSegment,
         backend: &Arc<Mutex<Option<Arc<TranscriptionBackend>>>>,
-        segment: &AudioSegment,
         language: &str,
         app_config: &SpeechConfig,
         stats: &Arc<Mutex<TranscriptionStats>>,
         audio_visualization_data: &Arc<RwLock<AudioVisualizationData>>,
-    ) -> String {
-        let start_time = Instant::now();
-        let duration = segment.end_time - segment.start_time;
-
-        tracing::info!("Processing manual segment: {:.2}s of audio", duration);
-
-        // Check if user wants to disable chunking entirely (experimental mode)
-        if app_config.manual_mode_config.disable_chunking {
-            tracing::info!(
-                "EXPERIMENTAL: Processing entire recording as single segment (chunking disabled)"
-            );
-            let result = Self::transcribe_segment(
-                backend,
-                segment,
-                language,
-                app_config,
-                stats,
-                audio_visualization_data,
-                None,
-            );
-            let processing_time = start_time.elapsed();
-            tracing::info!(
-                "Manual segment processing completed in {:.2}s",
-                processing_time.as_secs_f32()
-            );
-            return result;
-        }
-
-        // For very long segments, we might want to split them into smaller chunks
-        // to avoid memory issues and improve processing reliability
-        let chunk_threshold = {
-            let backend_max = backend
-                .lock()
-                .as_ref()
-                .and_then(|b| b.capabilities().max_audio_duration);
-            match backend_max {
-                Some(max) => max as f64,
-                None => app_config.manual_mode_config.chunk_duration_seconds as f64,
-            }
-        };
-        if duration >= chunk_threshold {
-            tracing::info!("Large manual segment detected, processing in chunks...");
-            return Self::process_large_manual_segment(
-                backend,
-                segment,
-                language,
-                app_config,
-                stats,
-                audio_visualization_data,
-            );
-        }
-
-        // Process normally for smaller manual segments
-        let result = Self::transcribe_segment(
-            backend,
-            segment,
-            language,
-            app_config,
-            stats,
-            audio_visualization_data,
-            None,
-        );
-
-        let processing_time = start_time.elapsed();
-        tracing::info!(
-            "Manual segment processing completed in {:.2}s",
-            processing_time.as_secs_f32()
-        );
-
-        result
-    }
-
-    /// Process very large manual segments by splitting into chunks using VAD-guided boundaries.
-    /// Finds natural pauses in speech to split at, avoiding mid-word cuts.
-    /// Falls back to time-based splitting if no pauses found or continuous speech exceeds limits.
-    fn process_large_manual_segment(
-        backend: &Arc<Mutex<Option<Arc<TranscriptionBackend>>>>,
-        segment: &AudioSegment,
-        language: &str,
-        app_config: &SpeechConfig,
-        stats: &Arc<Mutex<TranscriptionStats>>,
-        audio_visualization_data: &Arc<RwLock<AudioVisualizationData>>,
-    ) -> String {
-        let sample_rate = segment.sample_rate;
-        let max_chunk_seconds = backend
-            .lock()
+        backend_status: &RwLock<BackendStatus>,
+    ) -> Option<String> {
+        let mut guard = assembly.lock();
+        // Sessions arrive in order, so another session's assembly belongs to a
+        // session that never finished (it was cancelled).
+        if guard
             .as_ref()
-            .and_then(|b| b.capabilities().max_audio_duration)
-            .unwrap_or(app_config.manual_mode_config.chunk_duration_seconds);
-        let max_chunk_samples = (max_chunk_seconds as f64 * sample_rate as f64).round() as usize;
-        let total_len = segment.samples.len();
-
-        tracing::info!(
-            "Processing {:.1}s of audio with VAD-guided chunking (max chunk: {:.1}s)",
-            total_len as f64 / sample_rate as f64,
-            max_chunk_seconds
-        );
-
-        // Find natural pause points using VAD
-        let pause_points = find_pause_points(&segment.samples, sample_rate);
-
-        if !pause_points.is_empty() {
-            tracing::info!(
-                "Found {} natural pause point(s) in audio",
-                pause_points.len()
-            );
-        } else {
-            tracing::info!("No natural pauses detected, using time-based chunking");
-        }
-
-        // Build chunk ranges using pause points as preferred boundaries
-        let chunk_ranges =
-            Self::build_vad_guided_chunks(total_len, max_chunk_samples, &pause_points, sample_rate);
-
-        tracing::info!("Split into {} chunk(s)", chunk_ranges.len());
-
-        // Transcribe each chunk with prompt conditioning for continuity
-        let mut transcriptions: Vec<String> = Vec::new();
-        let mut previous_text = String::new();
-        const PROMPT_CONTEXT_WORDS: usize = 30;
-
-        for (chunk_idx, (start_idx, end_idx)) in chunk_ranges.iter().enumerate() {
-            let chunk_audio = segment.samples[*start_idx..*end_idx].to_vec();
-            let chunk_start_time = segment.start_time + (*start_idx as f64 / sample_rate as f64);
-            let chunk_end_time = segment.start_time + (*end_idx as f64 / sample_rate as f64);
-
-            let chunk_segment = AudioSegment {
-                samples: chunk_audio,
-                start_time: chunk_start_time,
-                end_time: chunk_end_time,
-                sample_rate,
+            .is_none_or(|current| current.session_id != segment.session_id)
+        {
+            *guard = Some(ManualAssembly {
                 session_id: segment.session_id.clone(),
-                is_manual: segment.is_manual,
+                carry: Vec::new(),
+                texts: Vec::new(),
+            });
+        }
+        let state = guard.as_mut()?;
+        state.carry.extend_from_slice(&segment.samples);
+
+        let chunking = !app_config.manual_mode_config.disable_chunking;
+        let transcribe = |samples: Vec<f32>, prompt: Option<&str>| {
+            let duration = samples.len() as f64 / segment.sample_rate as f64;
+            let chunk = AudioSegment {
+                samples,
+                start_time: 0.0,
+                end_time: duration,
+                sample_rate: segment.sample_rate,
+                session_id: segment.session_id.clone(),
+                is_manual: true,
+                partial: false,
             };
-
-            tracing::info!(
-                "Processing chunk {}/{} ({:.1}s - {:.1}s, {:.1}s duration)",
-                chunk_idx + 1,
-                chunk_ranges.len(),
-                chunk_start_time,
-                chunk_end_time,
-                chunk_end_time - chunk_start_time
-            );
-
-            // Use previous transcription as prompt for continuity (whisper.cpp only)
-            let prompt = if !previous_text.is_empty() {
-                Some(extract_prompt_context(&previous_text, PROMPT_CONTEXT_WORDS))
-            } else {
-                None
-            };
-
-            let chunk_transcription = Self::transcribe_segment(
+            tracing::info!("Transcribing manual chunk of {:.1}s", duration);
+            Self::transcribe_segment(
                 backend,
-                &chunk_segment,
+                &chunk,
                 language,
                 app_config,
                 stats,
                 audio_visualization_data,
-                prompt.as_deref(),
-            );
+                backend_status,
+                prompt,
+            )
+        };
 
-            if !chunk_transcription.is_empty() {
-                let trimmed = chunk_transcription.trim().to_string();
-                if !trimmed.is_empty() {
-                    transcriptions.push(trimmed.clone());
-                    previous_text = trimmed;
-                }
-            }
-        }
-
-        // Combine all chunk transcriptions
-        transcriptions.join(" ")
-    }
-
-    /// Build chunk ranges using VAD pause points as preferred split locations.
-    /// Tries to split at natural pauses, falls back to time-based if needed.
-    fn build_vad_guided_chunks(
-        total_len: usize,
-        max_chunk_samples: usize,
-        pause_points: &[usize],
-        sample_rate: usize,
-    ) -> Vec<(usize, usize)> {
-        let mut chunk_ranges: Vec<(usize, usize)> = Vec::new();
-        let mut start_idx = 0;
-
-        // Minimum chunk size (avoid tiny fragments)
-        let min_chunk_samples = sample_rate * 2; // 2 seconds minimum
-
-        while start_idx < total_len {
-            let remaining = total_len - start_idx;
-
-            // If remaining audio fits in one chunk, take it all
-            if remaining <= max_chunk_samples {
-                chunk_ranges.push((start_idx, total_len));
-                break;
-            }
-
-            // Find the best pause point within our max chunk size
-            let max_end = start_idx + max_chunk_samples;
-            let best_pause = pause_points
-                .iter()
-                .filter(|&&p| p > start_idx + min_chunk_samples && p <= max_end)
-                .max(); // Take the latest pause within range (largest chunk)
-
-            let end_idx = if let Some(&pause) = best_pause {
-                // Split at the natural pause
-                tracing::info!(
-                    "  Splitting at pause at {:.1}s",
-                    pause as f64 / sample_rate as f64
-                );
-                pause
-            } else {
-                // No pause found, fall back to max chunk size
-                max_end.min(total_len)
-            };
-
-            chunk_ranges.push((start_idx, end_idx));
-            start_idx = end_idx;
-        }
-
-        // Merge trailing tiny chunk into previous if too short
-        if chunk_ranges.len() > 1 {
-            if let Some(&(last_start, last_end)) = chunk_ranges.last() {
-                let last_len = last_end - last_start;
-                if last_len < min_chunk_samples {
-                    let len = chunk_ranges.len();
-                    if let Some(prev_range) = chunk_ranges.get_mut(len - 2) {
-                        let merged_len = last_end - prev_range.0;
-                        // Only merge if result is within reasonable limits (45s)
-                        if merged_len <= sample_rate * 45 {
-                            prev_range.1 = last_end;
-                            chunk_ranges.pop();
-                        }
+        if chunking {
+            let max_chunk_samples = (Self::max_chunk_seconds(backend, app_config) as f64
+                * segment.sample_rate as f64)
+                .round() as usize;
+            let min_chunk_samples = segment.sample_rate * 2;
+            // Cut only with 2 s to spare, so the rest never becomes a tiny chunk
+            // that the model hallucinates on.
+            while state.carry.len() >= max_chunk_samples + min_chunk_samples {
+                let pauses =
+                    find_pause_points(&state.carry[..max_chunk_samples], segment.sample_rate);
+                // The latest natural pause within the limit, else a hard cut.
+                let split = pauses
+                    .into_iter()
+                    .filter(|&pause| pause > min_chunk_samples && pause <= max_chunk_samples)
+                    .max()
+                    .unwrap_or(max_chunk_samples);
+                let chunk: Vec<f32> = state.carry.drain(..split).collect();
+                let prompt = state
+                    .texts
+                    .last()
+                    .map(|text| extract_prompt_context(text, PROMPT_CONTEXT_WORDS));
+                if let Some(text) = transcribe(chunk, prompt.as_deref()) {
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        state.texts.push(text.to_string());
                     }
                 }
             }
         }
 
-        chunk_ranges
+        if segment.partial {
+            return None;
+        }
+
+        let mut state = guard.take()?;
+        drop(guard);
+        if !state.carry.is_empty() {
+            let prompt = state
+                .texts
+                .last()
+                .filter(|_| chunking)
+                .map(|text| extract_prompt_context(text, PROMPT_CONTEXT_WORDS));
+            if let Some(text) = transcribe(std::mem::take(&mut state.carry), prompt.as_deref()) {
+                let text = text.trim();
+                if !text.is_empty() {
+                    state.texts.push(text.to_string());
+                }
+            }
+        }
+        Some(state.texts.join(" "))
+    }
+
+    /// Longest audio one backend call gets: the backend's own limit, else the configured chunk.
+    fn max_chunk_seconds(
+        backend: &Arc<Mutex<Option<Arc<TranscriptionBackend>>>>,
+        app_config: &SpeechConfig,
+    ) -> f32 {
+        backend
+            .lock()
+            .as_ref()
+            .and_then(|b| b.capabilities().max_audio_duration)
+            .unwrap_or(app_config.manual_mode_config.chunk_duration_seconds)
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::TranscriptionProcessor;
+/// Words of the previous chunk given to whisper.cpp as context for the next one.
+const PROMPT_CONTEXT_WORDS: usize = 30;
 
-    #[test]
-    fn build_vad_guided_chunks_prefers_latest_pause_within_limit() {
-        let sample_rate = 10;
-        let ranges =
-            TranscriptionProcessor::build_vad_guided_chunks(100, 40, &[25, 35, 70], sample_rate);
-
-        assert_eq!(ranges, vec![(0, 35), (35, 70), (70, 100)]);
-    }
-
-    #[test]
-    fn build_vad_guided_chunks_falls_back_to_max_size_without_pause() {
-        let sample_rate = 10;
-        let ranges = TranscriptionProcessor::build_vad_guided_chunks(105, 40, &[], sample_rate);
-
-        assert_eq!(ranges, vec![(0, 40), (40, 80), (80, 105)]);
-    }
-
-    #[test]
-    fn build_vad_guided_chunks_merges_tiny_trailing_chunk() {
-        let sample_rate = 10;
-        let ranges = TranscriptionProcessor::build_vad_guided_chunks(85, 40, &[], sample_rate);
-
-        assert_eq!(ranges, vec![(0, 40), (40, 85)]);
-    }
+/// Audio and text of the manual session being transcribed while it records.
+struct ManualAssembly {
+    session_id: Option<String>,
+    /// Audio not yet transcribed.
+    carry: Vec<f32>,
+    texts: Vec<String>,
 }

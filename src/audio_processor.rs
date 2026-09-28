@@ -13,6 +13,9 @@ use crate::silero_audio_processor::{AudioSegment, SileroVad, VadState};
 use crate::state::AudioVisualizationData;
 use crate::transcription_stats::TranscriptionStats;
 
+/// How much manual audio gathers before it goes to transcription as a part.
+const MANUAL_PART_SECONDS: usize = 10;
+
 /// Handles audio processing and voice activity detection
 pub struct AudioProcessor {
     running: Arc<AtomicBool>,
@@ -28,8 +31,14 @@ pub struct AudioProcessor {
 
     // Manual mode fields
     transcription_mode: Arc<AtomicU8>,
+    /// Audio of the current session not yet sent for transcription.
     manual_audio_buffer: Arc<Mutex<Vec<f32>>>,
+    /// Session length cap in samples; recording stops there.
     manual_buffer_max_size: usize,
+    /// Samples recorded in the current session, sent or not.
+    manual_session_samples: Arc<AtomicUsize>,
+    /// Buffer length at which a part goes to transcription while recording.
+    manual_part_samples: usize,
     manual_session_tx: mpsc::Sender<crate::real_time_transcriber::ManualSessionCommand>,
 
     // Session tracking for preventing cross-session contamination
@@ -63,7 +72,16 @@ impl AudioProcessor {
         let manual_buffer_max_size = (app_config.manual_mode_config.max_recording_duration_secs
             as usize)
             * crate::config::SAMPLE_RATE;
-        let manual_audio_buffer = Arc::new(Mutex::new(Vec::with_capacity(manual_buffer_max_size)));
+        // Parts let long recordings transcribe while the user still speaks, so
+        // Stop only waits for the last part. Without chunking, all audio waits for Stop.
+        let manual_part_samples = if app_config.manual_mode_config.disable_chunking {
+            usize::MAX
+        } else {
+            MANUAL_PART_SECONDS * crate::config::SAMPLE_RATE
+        };
+        let manual_audio_buffer = Arc::new(Mutex::new(Vec::with_capacity(
+            manual_part_samples.min(manual_buffer_max_size),
+        )));
 
         // Initialize session ID based on transcription mode
         let initial_session_id =
@@ -86,6 +104,8 @@ impl AudioProcessor {
             transcription_mode,
             manual_audio_buffer,
             manual_buffer_max_size,
+            manual_session_samples: Arc::new(AtomicUsize::new(0)),
+            manual_part_samples,
             manual_session_tx,
             current_session_id: Arc::new(RwLock::new(initial_session_id)),
             debug_config: app_config.debug_config.clone(),
@@ -108,6 +128,8 @@ impl AudioProcessor {
         let transcription_mode = self.transcription_mode.clone();
         let manual_audio_buffer = self.manual_audio_buffer.clone();
         let manual_buffer_max_size = self.manual_buffer_max_size;
+        let manual_session_samples = self.manual_session_samples.clone();
+        let manual_part_samples = self.manual_part_samples;
         let transcription_stats = self.transcription_stats.clone();
         let session_id_ref = self.current_session_id.clone();
         let sample_rate = self.sample_rate;
@@ -187,9 +209,6 @@ impl AudioProcessor {
                 // When recording is active, try to receive audio data with timeout
                 match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
                     Ok(Some(samples)) => {
-                        // Increment received counter
-                        samples_received.fetch_add(1, Ordering::Release);
-
                         // Reuse buffer by clearing and extending
                         audio_buffer.clear();
                         audio_buffer.extend_from_slice(&samples);
@@ -224,17 +243,34 @@ impl AudioProcessor {
                                 .await;
                             }
                             TranscriptionMode::Manual => {
-                                let buffer_overflow = Self::process_manual_audio(
+                                let (buffer_overflow, part) = Self::process_manual_audio(
                                     &audio_buffer,
                                     &manual_audio_buffer,
                                     &audio_visualization_data,
                                     buffer_size,
                                     manual_buffer_max_size,
+                                    &manual_session_samples,
+                                    manual_part_samples,
                                     &recording,
                                     sample_rate,
                                     &mut visualization_buffer,
-                                )
-                                .await;
+                                );
+
+                                if let Some(samples) = part {
+                                    let duration = samples.len() as f64 / sample_rate as f64;
+                                    let part = AudioSegment {
+                                        samples,
+                                        start_time: 0.0,
+                                        end_time: duration,
+                                        sample_rate,
+                                        session_id: session_id_ref.read().clone(),
+                                        is_manual: true,
+                                        partial: true,
+                                    };
+                                    if let Err(e) = segment_tx.send(part).await {
+                                        tracing::warn!("Failed to send manual audio part: {}", e);
+                                    }
+                                }
 
                                 // If buffer overflow occurred, automatically trigger session stop
                                 // to transcribe the accumulated audio
@@ -279,6 +315,10 @@ impl AudioProcessor {
                             let _ = stream_tx.send(StreamEvent::End).await;
                             stream_active = false;
                         }
+
+                        // Counted only once handled, parts included, so the drain after
+                        // Stop cannot send the final segment ahead of the last part.
+                        samples_received.fetch_add(1, Ordering::Release);
                     }
                     Ok(None) => {
                         // Channel closed
@@ -412,18 +452,21 @@ impl AudioProcessor {
         }
     }
 
-    /// Process audio in manual mode (accumulate for batch processing)
+    /// Process audio in manual mode (accumulate for batch processing).
+    /// Returns whether the session hit its length cap, and a full part to send.
     #[allow(clippy::too_many_arguments)]
-    async fn process_manual_audio(
+    fn process_manual_audio(
         audio_buffer: &[f32],
         manual_audio_buffer: &Arc<Mutex<Vec<f32>>>,
         audio_visualization_data: &Arc<RwLock<AudioVisualizationData>>,
         buffer_size: usize,
         manual_buffer_max_size: usize,
+        manual_session_samples: &AtomicUsize,
+        manual_part_samples: usize,
         recording: &Arc<AtomicBool>,
         sample_rate: usize,
         visualization_buffer: &mut Vec<f32>,
-    ) -> bool {
+    ) -> (bool, Option<Vec<f32>>) {
         // Update visualization data
         if let Some(mut audio_data) = audio_visualization_data.try_write() {
             visualization_buffer.clear();
@@ -440,16 +483,16 @@ impl AudioProcessor {
         // Accumulate audio in manual buffer with overflow protection
         // Use lock() instead of try_lock() to guarantee no audio samples are dropped
         let mut manual_buffer = manual_audio_buffer.lock();
-        let current_size = manual_buffer.len();
+        let current_size = manual_session_samples.load(Ordering::Relaxed);
         let new_size = current_size + audio_buffer.len();
 
-        // Check if adding this audio would exceed the buffer limit
-        if new_size > manual_buffer_max_size {
+        // Check if adding this audio would exceed the session limit
+        let overflow = if new_size > manual_buffer_max_size {
             let current_duration = current_size as f64 / sample_rate as f64;
             let max_duration = manual_buffer_max_size as f64 / sample_rate as f64;
 
             tracing::warn!(
-                "Manual buffer full ({:.1}s / {:.1}s). Recording stopped.",
+                "Manual session full ({:.1}s / {:.1}s). Recording stopped.",
                 current_duration,
                 max_duration
             );
@@ -459,21 +502,26 @@ impl AudioProcessor {
 
             // Add as much as we can without exceeding the limit
             let space_remaining = manual_buffer_max_size.saturating_sub(current_size);
-            if space_remaining > 0 {
-                manual_buffer.extend_from_slice(&audio_buffer[..space_remaining]);
-            }
-
-            // Return true to indicate overflow occurred
+            manual_buffer.extend_from_slice(&audio_buffer[..space_remaining]);
+            manual_session_samples.fetch_add(space_remaining, Ordering::Relaxed);
             true
         } else {
             manual_buffer.extend_from_slice(audio_buffer);
+            manual_session_samples.fetch_add(audio_buffer.len(), Ordering::Relaxed);
             false
-        }
+        };
+
+        let part = (!overflow && manual_buffer.len() >= manual_part_samples)
+            .then(|| std::mem::take(&mut *manual_buffer));
+        (overflow, part)
     }
 
     /// Process accumulated manual audio when session ends
     /// Manual mode transcribes the entire buffer without VAD filtering to guarantee
     /// that no speech is missed. User controls start/stop explicitly.
+    ///
+    /// The final segment goes out even when empty: it tells the transcription
+    /// processor that the parts sent while recording are complete.
     pub async fn process_accumulated_manual_audio(
         &self,
         sample_rate: usize,
@@ -481,9 +529,6 @@ impl AudioProcessor {
     ) -> Result<(), anyhow::Error> {
         let accumulated_audio = {
             let mut manual_buffer = self.manual_audio_buffer.lock();
-            if manual_buffer.is_empty() {
-                return Ok(()); // Nothing to process
-            }
             // Use mem::take instead of clone to avoid copying the entire buffer
             std::mem::take(&mut *manual_buffer)
         };
@@ -495,8 +540,11 @@ impl AudioProcessor {
             duration_secs
         );
 
-        // Save audio to WAV file for debugging
-        self.save_audio_to_wav(&accumulated_audio, sample_rate as u32);
+        // Save audio to WAV file for debugging. It holds only the audio after the
+        // last part sent while recording.
+        if !accumulated_audio.is_empty() {
+            self.save_audio_to_wav(&accumulated_audio, sample_rate as u32);
+        }
 
         // Create a single audio segment for transcription with ALL audio
         // No VAD filtering - guarantees every sample is transcribed
@@ -507,6 +555,7 @@ impl AudioProcessor {
             sample_rate,
             session_id: expected_session_id,
             is_manual: true, // Manual mode segment
+            partial: false,
         };
 
         // Send to transcription processor
@@ -551,6 +600,7 @@ impl AudioProcessor {
 
         // Use mem::take() to reuse buffer capacity (avoids reallocation)
         let _ = std::mem::take(&mut *buffer);
+        self.manual_session_samples.store(0, Ordering::Relaxed);
         *session_id_lock = Some(session_id);
     }
 

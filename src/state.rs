@@ -1,5 +1,5 @@
 /// Processing states for transcription
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProcessingState {
     /// No active processing
     Idle,
@@ -85,11 +85,12 @@ impl AudioVisualizationData {
 }
 
 /// Status state of the transcription backend
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum BackendStatusState {
     Ready,
     Loading(String),
-    Error(String),
+    /// No backend is loaded, so recordings cannot be transcribed.
+    NoModel,
 }
 
 /// Shared backend status for the status bar
@@ -98,7 +99,9 @@ pub struct BackendStatus {
     pub backend_name: String,
     pub model_name: String,
     pub state: BackendStatusState,
-    pub error_time: Option<std::time::Instant>,
+    /// Most recent user-facing error and when it was reported. The app decides
+    /// how long to show it.
+    pub last_error: Option<(String, std::time::Instant)>,
     pub download_progress: Option<f32>,
     pub is_recording: bool,
     pub recording_start: Option<std::time::Instant>,
@@ -110,10 +113,15 @@ impl BackendStatus {
             backend_name,
             model_name,
             state: BackendStatusState::Ready,
-            error_time: None,
+            last_error: None,
             download_progress: None,
             is_recording: false,
             recording_start: None,
         }
+    }
+
+    /// Record an error for the app to show, replacing any earlier one.
+    pub fn report_error(&mut self, message: impl Into<String>) {
+        self.last_error = Some((message.into(), std::time::Instant::now()));
     }
 }

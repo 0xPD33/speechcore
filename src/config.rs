@@ -17,11 +17,18 @@ pub struct AudioProcessorConfig {
     /// This is the fundamental audio processing block size in samples
     /// Also used for visualization sample count
     pub buffer_size: usize,
+    /// Microphone to record from: part of its name, matched without case.
+    /// The system default input when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_device: Option<String>,
 }
 
 impl Default for AudioProcessorConfig {
     fn default() -> Self {
-        Self { buffer_size: 1024 }
+        Self {
+            buffer_size: 1024,
+            input_device: None,
+        }
     }
 }
 
@@ -71,7 +78,7 @@ impl Default for RealtimeModeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ManualModeConfig {
-    /// Maximum recording duration in seconds (default: 120)
+    /// Maximum recording duration in seconds (default: 600)
     /// Buffer size is calculated as: max_recording_duration_secs * sample_rate
     pub max_recording_duration_secs: u32,
 
@@ -81,16 +88,6 @@ pub struct ManualModeConfig {
     /// Duration of each chunk in seconds (default: 29.0)
     /// Note: 29s avoids edge case where duration == chunk_size hits token limits
     pub chunk_duration_seconds: f32,
-
-    /// Whether to enable chunk overlap for manual mode transcription (default: true)
-    /// When enabled, uses small overlap between chunks to catch boundary words
-    /// Overlap amount is controlled by chunk_overlap_seconds
-    pub enable_chunk_overlap: bool,
-
-    /// Overlap duration in seconds between chunks (default: 0.5)
-    /// Only used when enable_chunk_overlap is true
-    /// Recommended range: 0.1 to 1.0 seconds (avoid 2+ seconds due to hallucination)
-    pub chunk_overlap_seconds: f32,
 
     /// EXPERIMENTAL: Disable chunking for manual mode transcription (default: false)
     /// When enabled, processes entire recording as single segment (no chunk limit)
@@ -102,11 +99,9 @@ pub struct ManualModeConfig {
 impl Default for ManualModeConfig {
     fn default() -> Self {
         Self {
-            max_recording_duration_secs: 120,
+            max_recording_duration_secs: 600,
             clear_on_new_session: true,
             chunk_duration_seconds: 29.0, // 29s avoids edge case at exactly 30s boundary
-            enable_chunk_overlap: true,   // Enable overlap by default
-            chunk_overlap_seconds: 2.0,   // 2.0 second overlap (matches packaged config)
             disable_chunking: false,      // Chunking enabled by default
         }
     }
@@ -158,6 +153,9 @@ pub struct PostProcessConfig {
     /// Append a full stop when the text ends without terminal punctuation.
     /// Off by default for the same reason as `capitalize_sentences`.
     pub ensure_terminal_punctuation: bool,
+    /// Whole-word replacements, matched without case: `"nix os" = "NixOS"`.
+    /// Fixes names and jargon for every backend.
+    pub replacements: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for PostProcessConfig {
@@ -171,6 +169,7 @@ impl Default for PostProcessConfig {
             collapse_repeated_words: false,
             capitalize_sentences: false,
             ensure_terminal_punctuation: false,
+            replacements: Default::default(),
         }
     }
 }
@@ -309,8 +308,9 @@ pub struct WhisperCppOptions {
     pub suppress_blank: bool,
     pub no_context: bool,
     pub max_tokens: i32,
-    /// Initial prompt to condition the model (used internally for chunk continuity)
-    #[serde(skip)]
+    /// Words and names to bias recognition toward (custom vocabulary).
+    /// Long recordings append each chunk's context after it.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub initial_prompt: Option<String>,
 }
 
@@ -321,7 +321,7 @@ impl Default for WhisperCppOptions {
             suppress_blank: true, // Skip blank segments
             no_context: true,     // Disable context to prevent double transcriptions
             max_tokens: 0,        // No limit
-            initial_prompt: None, // Set dynamically for chunk continuity
+            initial_prompt: None,
         }
     }
 }
