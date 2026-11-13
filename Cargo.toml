@@ -17,7 +17,7 @@ no-default-features = true
 
 [dependencies]
 portaudio = { version = "0.8.0", optional = true }
-ct2rs = { version = "0.9.11", features = ["whisper"], optional = true }
+ct2rs = { version = "0.11", features = ["whisper"], optional = true }
 ndarray = { version = "0.16.1", optional = true }
 serde_json = { version = "1.0", optional = true }
 reqwest = { version = "0.12", features = ["stream", "json"], optional = true }
@@ -30,7 +30,7 @@ rustfft = { version = "6.4", optional = true }
 ort = { version = "2.0.0-rc.10", features = ["ndarray"], optional = true }
 chrono = "0.4"
 num_cpus = "1"
-whisper-rs = { version = "0.15.1", optional = true }
+whisper-rs = { version = "0.16", optional = true }
 hound = { version = "3.5", optional = true }
 tokenizers = { version = "0.22", optional = true }
 tracing = "0.1"
