@@ -23,6 +23,11 @@ impl SessionLedger {
         Some(session_id)
     }
 
+    /// Whether the stopped session's transcript is not out yet.
+    pub(crate) fn is_awaiting(&self, session_id: &str) -> bool {
+        self.awaiting.iter().any(|id| id == session_id)
+    }
+
     /// Marks a session's transcript as out. Returns whether it was cancelled.
     fn finish(&mut self, session_id: &str) -> bool {
         self.awaiting.retain(|id| id != session_id);
@@ -652,6 +657,13 @@ impl TranscriptionProcessor {
                     backend_status
                         .write()
                         .report_error("No model loaded; recording not transcribed");
+                    if let (true, false, Some(id)) = (
+                        segment.is_manual,
+                        segment.partial,
+                        segment.session_id.as_deref(),
+                    ) {
+                        session_ledger.lock().finish(id);
+                    }
                     continue;
                 }
 

@@ -19,6 +19,9 @@ use crate::stats_reporter::StatsReporter;
 use crate::transcription_processor::{SessionLedger, TranscriptionProcessor};
 use crate::transcription_stats::TranscriptionStats;
 
+/// Longest wait for a stopped manual session's transcript; a backstop only.
+const MANUAL_TRANSCRIPT_WAIT: Duration = Duration::from_secs(600);
+
 /// Transcription mode enumeration
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TranscriptionMode {
@@ -731,6 +734,7 @@ impl RealTimeTranscriber {
                                                 let processing_manual_session =
                                                     processing_manual_session.clone();
                                                 let feedback_sink_for_task = feedback_sink.clone();
+                                                let session_ledger_for_task = session_ledger.clone();
                                                 let audio_viz_data = audio_visualization_data.clone();
                                                 let captured_session_id = session_id.clone(); // Capture before spawning
                                                 let recording_for_task = recording.clone();
@@ -790,6 +794,17 @@ impl RealTimeTranscriber {
                                                     // The audio is taken now, so a new session may clear the
                                                     // buffer while this one is still being transcribed.
                                                     drop(finalizing_guard);
+
+                                                    // The audio is only queued. Wait for its transcript, so
+                                                    // `Completed` and the sound mean the text is out.
+                                                    if transcription_result.is_ok() {
+                                                        let deadline = Instant::now() + MANUAL_TRANSCRIPT_WAIT;
+                                                        while session_ledger_for_task.lock().is_awaiting(&session_id)
+                                                            && Instant::now() < deadline
+                                                        {
+                                                            tokio::time::sleep(Duration::from_millis(25)).await;
+                                                        }
+                                                    }
 
                                                     if let Err(e) = transcription_result {
                                                         tracing::warn!(
