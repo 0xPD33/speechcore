@@ -863,19 +863,12 @@ pub async fn download_whisper_cpp_model_with_progress(
     quantization: &QuantizationLevel,
     on_progress: Option<&(dyn Fn(f64) + Send + Sync)>,
 ) -> Result<PathBuf> {
-    let models_dir = get_models_dir()?;
-
-    // Determine quantization suffix for filename
-    // Available for whisper.cpp: full precision (no suffix), q8_0, q5_1
-    let quant_suffix = match quantization {
-        QuantizationLevel::High => "", // Full precision (148MB for base.en)
-        QuantizationLevel::Medium => "-q8_0", // Q8_0 quantization (82MB for base.en)
-        QuantizationLevel::Low => "-q5_1", // Q5_1 quantization (60MB for base.en)
-    };
-
-    // Build filename: ggml-{model}{quant}.bin
-    let filename = format!("ggml-{}{}.bin", model_name, quant_suffix);
-    let output_path = models_dir.join(&filename);
+    let output_path = get_whisper_cpp_model_path(model_name, quantization)?;
+    let filename = output_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_string();
 
     // Check if already exists
     if output_path.exists() {
@@ -913,11 +906,13 @@ pub fn get_whisper_cpp_model_path(
 ) -> Result<PathBuf> {
     let models_dir = get_models_dir()?;
 
-    // Available for whisper.cpp: full precision (no suffix), q8_0, q5_1
+    // The upstream repo has q5_1 files up to small, and q5_0 from medium on.
+    let large = model_name.starts_with("medium") || model_name.starts_with("large");
     let quant_suffix = match quantization {
-        QuantizationLevel::High => "",        // Full precision
-        QuantizationLevel::Medium => "-q8_0", // Q8_0 quantization
-        QuantizationLevel::Low => "-q5_1",    // Q5_1 quantization
+        QuantizationLevel::High => "",
+        QuantizationLevel::Medium => "-q8_0",
+        QuantizationLevel::Low if large => "-q5_0",
+        QuantizationLevel::Low => "-q5_1",
     };
 
     let filename = format!("ggml-{}{}.bin", model_name, quant_suffix);
