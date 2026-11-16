@@ -745,21 +745,42 @@ impl TranscriptionProcessor {
         };
 
         if chunking {
-            let max_chunk_samples = (Self::max_chunk_seconds(backend, app_config) as f64
-                * segment.sample_rate as f64)
-                .round() as usize;
+            let seconds = |s: f32| (s as f64 * segment.sample_rate as f64).round() as usize;
+            let max_seconds = Self::max_chunk_seconds(backend, app_config);
+            let max_chunk_samples = seconds(max_seconds);
+            // Chunks cut early, at a pause, are transcribed while the user still
+            // speaks, so the wait after the stop stays short at any length.
+            let target_samples = seconds(
+                app_config
+                    .manual_mode_config
+                    .chunk_duration_seconds
+                    .min(max_seconds),
+            );
             let min_chunk_samples = segment.sample_rate * 2;
             // Cut only with 2 s to spare, so the rest never becomes a tiny chunk
             // that the model hallucinates on.
-            while state.carry.len() >= max_chunk_samples + min_chunk_samples {
-                let pauses =
-                    find_pause_points(&state.carry[..max_chunk_samples], segment.sample_rate);
-                // The latest natural pause within the limit, else a hard cut.
-                let split = pauses
-                    .into_iter()
-                    .filter(|&pause| pause > min_chunk_samples && pause <= max_chunk_samples)
-                    .max()
-                    .unwrap_or(max_chunk_samples);
+            while state.carry.len() >= target_samples + min_chunk_samples {
+                let len = state.carry.len();
+                let pauses = find_pause_points(
+                    &state.carry[..len.min(max_chunk_samples)],
+                    segment.sample_rate,
+                );
+                let early = pauses
+                    .iter()
+                    .copied()
+                    .filter(|&pause| pause >= target_samples && pause <= len - min_chunk_samples)
+                    .min();
+                let split = match early {
+                    Some(pause) => pause,
+                    // No pause yet: wait for more audio until the backend limit.
+                    None if len < max_chunk_samples + min_chunk_samples => break,
+                    // At the limit: the latest natural pause within it, else a hard cut.
+                    None => pauses
+                        .into_iter()
+                        .filter(|&pause| pause > min_chunk_samples && pause <= max_chunk_samples)
+                        .max()
+                        .unwrap_or(max_chunk_samples),
+                };
                 let chunk: Vec<f32> = state.carry.drain(..split).collect();
                 let prompt = state
                     .texts
